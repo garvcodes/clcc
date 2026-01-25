@@ -53,7 +53,7 @@ def load_raw_umi_matrix(
     """
     Load raw UMI count matrix and filter to specific samples.
 
-    The full matrix is large (~29K genes x 208K cells), so we load
+    The full matrix is much too large (~29K genes x 208K cells), so we load
     annotations first to identify relevant cell barcodes, then load
     only those columns from the matrix.
 
