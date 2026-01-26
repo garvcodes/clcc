@@ -55,6 +55,12 @@ Thumbs.db
 # QC plot outputs (regeneratable)
 data/processed/*_qc_plots/
 
+# CNV output (regeneratable)
+data/cnv_output/
+
+# Model files (too large for GitHub)
+models/
+
 # Logs
 *.log
 
