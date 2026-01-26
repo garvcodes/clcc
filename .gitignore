@@ -66,3 +66,4 @@ models/
 
 # Local config
 .env
+data/de_results/
