@@ -1,11 +1,20 @@
 """
-Differential expression analysis based on CNV status.
+Concordance-based differential expression analysis for CANCER CELLS ONLY.
 
-This script identifies genes differentially expressed between:
-1. High-CNV vs Low-CNV cells (based on cnv_score)
-2. Cancer vs Normal cells
-3. Between CNV subclusters
-4. Genes in amplified/deleted chromosomal regions
+This script identifies genes differentially expressed between CNV-concordant
+and CNV-discordant cancer cells. The key insight is that the contrastive model
+learns the expected relationship between expression and CNV. Cancer cells that
+deviate from this relationship (high embedding distance) may have regulatory
+escape mechanisms that contribute to tumor progression.
+
+Focus: Compensation mechanisms in cancer cells
+- Concordant: cancer cells where expression matches expected CNV pattern
+- Discordant: cancer cells where expression deviates from CNV pattern
+- DE between these groups reveals genes involved in dosage compensation,
+  epigenetic silencing, or other regulatory escape mechanisms
+
+For standard DE analyses (cancer vs normal, high vs low CNV, etc.),
+see 08b_standard_de.py
 
 Usage:
     python 08_differential_expression.py --patient P0006
@@ -19,8 +28,9 @@ import pandas as pd
 import scanpy as sc
 import matplotlib.pyplot as plt
 import seaborn as sns
-from scipy import stats
-from typing import Dict, List, Tuple, Optional
+from scipy import sparse
+from typing import Dict, List, Tuple
+import torch
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -46,584 +56,514 @@ def load_cnv_data(
     return adata
 
 
-def load_all_patients(
-    patient_ids: List[str],
-    cnv_dir: str = 'data/cnv_output'
-) -> sc.AnnData:
-    """Load and concatenate data from multiple patients."""
-    adatas = []
-
-    for patient_id in patient_ids:
-        try:
-            adata = load_cnv_data(patient_id, cnv_dir)
-            adata.obs['patient_id'] = patient_id
-            # Make CNV leiden unique per patient
-            adata.obs['cnv_leiden_patient'] = patient_id + '_' + adata.obs['cnv_leiden'].astype(str)
-            adatas.append(adata)
-        except Exception as e:
-            print(f"Warning: Could not load {patient_id}: {e}")
-            continue
-
-    if not adatas:
-        raise ValueError("No patient data could be loaded")
-
-    # Concatenate
-    adata = sc.concat(adatas, join='inner')
-    print(f"\nCombined: {adata.n_obs:,} cells, {adata.n_vars:,} genes")
-
-    return adata
+def get_available_patients(cnv_dir: str = 'data/cnv_output') -> List[str]:
+    """Get list of patients with CNV data."""
+    patients = []
+    if os.path.exists(cnv_dir):
+        for name in os.listdir(cnv_dir):
+            if name.startswith('P') and os.path.isdir(os.path.join(cnv_dir, name)):
+                cnv_file = os.path.join(cnv_dir, name, f'{name}_cnv.h5ad')
+                if os.path.exists(cnv_file):
+                    patients.append(name)
+    return sorted(patients)
 
 
 # ============================================================================
-# CNV Score Groups
+# Contrastive Embedding Loading & Concordance Analysis
 # ============================================================================
 
-def create_cnv_groups(
-    adata: sc.AnnData,
-    method: str = 'quantile',
-    n_groups: int = 3,
-    quantiles: Tuple[float, float] = (0.25, 0.75)
-) -> sc.AnnData:
-    """
-    Create CNV burden groups based on cnv_score.
-
-    Args:
-        adata: AnnData with cnv_score in obs
-        method: 'quantile' or 'fixed'
-        n_groups: Number of groups (2 or 3)
-        quantiles: Quantile thresholds for 3-group split
-
-    Returns:
-        AnnData with 'cnv_group' column added
-    """
-    scores = adata.obs['cnv_score'].values
-
-    if method == 'quantile':
-        if n_groups == 2:
-            median = np.median(scores)
-            groups = np.where(scores >= median, 'High_CNV', 'Low_CNV')
-        else:
-            q_low, q_high = np.quantile(scores, quantiles)
-            groups = np.where(scores <= q_low, 'Low_CNV',
-                            np.where(scores >= q_high, 'High_CNV', 'Mid_CNV'))
-    else:
-        # Fixed thresholds based on score distribution
-        threshold = scores.mean() + scores.std()
-        groups = np.where(scores >= threshold, 'High_CNV', 'Low_CNV')
-
-    adata.obs['cnv_group'] = pd.Categorical(groups)
-
-    print(f"\nCNV groups:")
-    for group in adata.obs['cnv_group'].cat.categories:
-        n = (adata.obs['cnv_group'] == group).sum()
-        print(f"  {group}: {n:,} cells")
-
-    return adata
-
-
-# ============================================================================
-# Differential Expression
-# ============================================================================
-
-def run_de_analysis(
-    adata: sc.AnnData,
-    groupby: str,
-    groups: Optional[List[str]] = None,
-    reference: str = 'rest',
-    method: str = 'wilcoxon',
-    min_cells: int = 10
-) -> pd.DataFrame:
-    """
-    Run differential expression analysis.
-
-    Args:
-        adata: AnnData object
-        groupby: Column in obs to group by
-        groups: Specific groups to test (default: all)
-        reference: Reference group ('rest' or specific group name)
-        method: DE method ('wilcoxon', 't-test', 't-test_overestim_var')
-        min_cells: Minimum cells per group
-
-    Returns:
-        DataFrame with DE results
-    """
-    # Filter groups with too few cells
-    group_counts = adata.obs[groupby].value_counts()
-    valid_groups = group_counts[group_counts >= min_cells].index.tolist()
-
-    # Debug: show what we have
-    print(f"\n  Group counts for '{groupby}':")
-    for g, c in group_counts.items():
-        print(f"    {g}: {c:,} cells")
-
-    if groups:
-        groups = [g for g in groups if g in valid_groups]
-    else:
-        groups = valid_groups
-
-    # Check if we have enough groups
-    # For 'rest' reference: need at least 2 valid groups
-    # For specific reference: need at least 1 group AND reference must be valid
-    if reference == 'rest':
-        if len(groups) < 2:
-            print(f"Warning: Not enough groups with >= {min_cells} cells for 'rest' comparison")
-            return pd.DataFrame()
-    else:
-        # Specific reference - check if both group and reference are valid
-        if len(groups) < 1:
-            print(f"Warning: No valid test groups with >= {min_cells} cells")
-            return pd.DataFrame()
-        if reference not in valid_groups:
-            print(f"Warning: Reference group '{reference}' has < {min_cells} cells")
-            return pd.DataFrame()
-
-    print(f"\nRunning DE analysis: {groupby}")
-    print(f"  Method: {method}")
-    print(f"  Groups: {groups}")
-    print(f"  Reference: {reference}")
-
-    # Run DE
-    sc.tl.rank_genes_groups(
-        adata,
-        groupby=groupby,
-        groups=groups,
-        reference=reference,
-        method=method,
-        pts=True  # Include percentage of cells expressing
-    )
-
-    # Extract results
-    results = []
-    for group in groups:
-        df = sc.get.rank_genes_groups_df(adata, group=group)
-        df['group'] = group
-        df['comparison'] = f"{group}_vs_{reference}"
-        results.append(df)
-
-    de_results = pd.concat(results, ignore_index=True)
-
-    # Add significance flags
-    de_results['significant'] = (
-        (de_results['pvals_adj'] < 0.05) &
-        (np.abs(de_results['logfoldchanges']) > 0.5)
-    )
-
-    n_sig = de_results['significant'].sum()
-    print(f"  Significant genes (padj < 0.05, |logFC| > 0.5): {n_sig:,}")
-
-    return de_results
-
-
-def run_high_vs_low_cnv(
-    adata: sc.AnnData,
-    method: str = 'wilcoxon'
-) -> pd.DataFrame:
-    """Run DE between high and low CNV burden cells."""
-    # Create CNV groups if not present
-    if 'cnv_group' not in adata.obs.columns:
-        adata = create_cnv_groups(adata, n_groups=2)
-
-    # Filter to just High and Low
-    adata_subset = adata[adata.obs['cnv_group'].isin(['High_CNV', 'Low_CNV'])].copy()
-
-    return run_de_analysis(
-        adata_subset,
-        groupby='cnv_group',
-        groups=['High_CNV'],
-        reference='Low_CNV',
-        method=method
-    )
-
-
-def run_cancer_vs_normal(
-    adata: sc.AnnData,
-    method: str = 'wilcoxon'
-) -> pd.DataFrame:
-    """Run DE between cancer and normal cells."""
-    return run_de_analysis(
-        adata,
-        groupby='cancer_vs_normal',
-        groups=['Cancer'],
-        reference='Normal',
-        method=method
-    )
-
-
-def run_subcluster_de(
-    adata: sc.AnnData,
-    top_n_clusters: int = 5,
-    method: str = 'wilcoxon'
-) -> pd.DataFrame:
-    """Run DE for top CNV subclusters vs rest."""
-    # Find top clusters by CNV score
-    cluster_scores = adata.obs.groupby('cnv_leiden')['cnv_score'].mean()
-    top_clusters = cluster_scores.nlargest(top_n_clusters).index.tolist()
-
-    print(f"\nTop {top_n_clusters} CNV subclusters by mean score:")
-    for c in top_clusters:
-        score = cluster_scores[c]
-        n = (adata.obs['cnv_leiden'] == c).sum()
-        print(f"  Cluster {c}: score={score:.3f}, n={n:,}")
-
-    return run_de_analysis(
-        adata,
-        groupby='cnv_leiden',
-        groups=[str(c) for c in top_clusters],
-        reference='rest',
-        method=method
-    )
-
-
-# ============================================================================
-# Chromosome-specific Analysis
-# ============================================================================
-
-def get_chromosome_cnv_mapping(adata: sc.AnnData) -> Dict[str, Tuple[int, int]]:
-    """
-    Map chromosomes to their corresponding CNV window indices.
-
-    The X_cnv matrix columns are genomic windows. We need to figure out
-    which windows correspond to which chromosomes based on the uns metadata.
-
-    infercnvpy stores this in adata.uns['cnv']['chr_pos'] as a dict mapping
-    chromosome names (e.g., 'chr1') to their START index in the X_cnv matrix.
-
-    Returns:
-        Dict mapping chromosome (without 'chr' prefix) to (start_idx, end_idx) tuple
-    """
-    # infercnvpy stores window info in uns
-    if 'cnv' not in adata.uns:
-        print("  Note: No 'cnv' key in adata.uns")
-        return {}
-
-    cnv_info = adata.uns.get('cnv', {})
-    print(f"  CNV uns keys: {list(cnv_info.keys())}")
-
-    chr_mapping = {}
-
-    # infercnvpy stores chr_pos: dict mapping 'chr1' -> start_index
-    if 'chr_pos' in cnv_info:
-        chr_pos = cnv_info['chr_pos']
-        print(f"  Found 'chr_pos' with {len(chr_pos)} chromosomes")
-
-        # Get total number of windows
-        n_windows = adata.obsm['X_cnv'].shape[1]
-
-        # Sort by start index to determine end indices
-        sorted_chroms = sorted(chr_pos.items(), key=lambda x: x[1])
-
-        for i, (chrom_name, start_idx) in enumerate(sorted_chroms):
-            # End index is the start of the next chromosome, or n_windows
-            if i + 1 < len(sorted_chroms):
-                end_idx = sorted_chroms[i + 1][1]
-            else:
-                end_idx = n_windows
-
-            # Normalize chromosome name (remove 'chr' prefix if present)
-            chrom = str(chrom_name).replace('chr', '')
-            chr_mapping[chrom] = (int(start_idx), int(end_idx))
-
-        print(f"  Mapped {len(chr_mapping)} chromosomes to CNV window ranges")
-
-    elif 'chr' in cnv_info:
-        # Alternative format: array of chromosome labels per window
-        chr_labels = cnv_info['chr']
-        print(f"  Found 'chr' array with {len(chr_labels)} entries")
-
-        # Group consecutive windows by chromosome
-        current_chr = None
-        start_idx = 0
-        for i, chrom in enumerate(chr_labels):
-            chrom = str(chrom).replace('chr', '')
-            if chrom != current_chr:
-                if current_chr is not None:
-                    chr_mapping[current_chr] = (start_idx, i)
-                current_chr = chrom
-                start_idx = i
-        # Don't forget the last chromosome
-        if current_chr is not None:
-            chr_mapping[current_chr] = (start_idx, len(chr_labels))
-
-        print(f"  Mapped {len(chr_mapping)} chromosomes to CNV window ranges")
-    else:
-        print("  Note: No chromosome info found in cnv uns - will use global CNV score")
-
-    return chr_mapping
-
-
-def analyze_cnv_regions(
-    adata: sc.AnnData,
-    cnv_threshold: float = 0.1
-) -> pd.DataFrame:
-    """
-    Identify chromosomal regions with significant CNV and test for
-    TRUE cis-effects: correlation between chromosome-specific CNV and
-    expression of genes ON THAT SAME chromosome.
-
-    This tests the gene dosage hypothesis: if a chromosome is amplified,
-    are genes on that chromosome upregulated proportionally?
-
-    Args:
-        adata: AnnData with CNV data
-        cnv_threshold: Threshold for calling amplification/deletion
-
-    Returns:
-        DataFrame with per-chromosome cis-effect analysis
-    """
-    print("\nAnalyzing chromosome-specific cis-effects...")
-    print("Testing: Does chr X CNV correlate with chr X gene expression?")
-
-    cnv_matrix = adata.obsm['X_cnv']
-    if hasattr(cnv_matrix, 'toarray'):
-        cnv_matrix = cnv_matrix.toarray()
-
-    if 'chromosome' not in adata.var.columns:
-        print("Warning: No chromosome info in var, skipping region analysis")
-        return pd.DataFrame()
-
-    # Try to get chromosome-to-CNV-window mapping
-    chr_cnv_map = get_chromosome_cnv_mapping(adata)
-
-    results = []
-    chromosomes = sorted(adata.var['chromosome'].dropna().unique())
-
-    # Sort chromosomes properly
-    def chrom_sort_key(x):
-        x = str(x).replace('chr', '')
-        if x == 'X':
-            return 23
-        elif x == 'Y':
-            return 24
-        else:
-            try:
-                return int(x)
-            except:
-                return 99
-
-    chromosomes = sorted(chromosomes, key=chrom_sort_key)
-
-    for chrom in chromosomes:
-        # Get genes on this chromosome
-        chrom_genes = adata.var[adata.var['chromosome'] == chrom].index
-
-        if len(chrom_genes) < 10:
-            continue
-
-        # Get mean expression of genes on this chromosome (per cell)
-        chrom_expr = adata[:, chrom_genes].X
-        if hasattr(chrom_expr, 'toarray'):
-            chrom_expr = chrom_expr.toarray()
-        mean_expr_per_cell = chrom_expr.mean(axis=1)
-
-        # Get CNV for this specific chromosome
-        # Normalize chromosome name to match mapping (without 'chr' prefix)
-        chrom_key = str(chrom).replace('chr', '')
-        if chrom_key in chr_cnv_map:
-            # Use chromosome-specific CNV windows
-            start_idx, end_idx = chr_cnv_map[chrom_key]
-            chrom_cnv_per_cell = cnv_matrix[:, start_idx:end_idx].mean(axis=1)
-            cnv_source = 'chromosome-specific'
-        else:
-            # Fallback: estimate from expression-derived CNV
-            # This is less accurate but still informative
-            chrom_cnv_per_cell = adata.obs['cnv_score'].values
-            cnv_source = 'global-score'
-
-        # TRUE CIS-EFFECT: Correlate chr X expression with chr X CNV
-        corr_cis, pval_cis = stats.pearsonr(mean_expr_per_cell, chrom_cnv_per_cell)
-
-        # TRANS-EFFECT comparison: Correlate chr X expression with global CNV
-        # (only meaningful if we have chromosome-specific CNV)
-        global_cnv = adata.obs['cnv_score'].values
-        corr_trans, pval_trans = stats.pearsonr(mean_expr_per_cell, global_cnv)
-
-        # Calculate mean CNV for this chromosome
-        mean_chrom_cnv = chrom_cnv_per_cell.mean()
-        std_chrom_cnv = chrom_cnv_per_cell.std()
-
-        # Identify cells with amplification vs deletion for this chromosome
-        amp_cells = chrom_cnv_per_cell > (mean_chrom_cnv + std_chrom_cnv)
-        del_cells = chrom_cnv_per_cell < (mean_chrom_cnv - std_chrom_cnv)
-
-        expr_amp = mean_expr_per_cell[amp_cells].mean() if amp_cells.sum() > 5 else np.nan
-        expr_del = mean_expr_per_cell[del_cells].mean() if del_cells.sum() > 5 else np.nan
-        expr_neutral = mean_expr_per_cell[~amp_cells & ~del_cells].mean()
-
-        # Fold changes
-        fc_amp_vs_neutral = expr_amp / (expr_neutral + 1e-8) if not np.isnan(expr_amp) else np.nan
-        fc_del_vs_neutral = expr_del / (expr_neutral + 1e-8) if not np.isnan(expr_del) else np.nan
-
-        results.append({
-            'chromosome': chrom,
-            'n_genes': len(chrom_genes),
-            'cnv_source': cnv_source,
-            'mean_cnv': mean_chrom_cnv,
-            'std_cnv': std_chrom_cnv,
-            # Cis-effect (the key metric)
-            'cis_correlation': corr_cis,
-            'cis_pval': pval_cis,
-            # Trans-effect for comparison
-            'trans_correlation': corr_trans,
-            'trans_pval': pval_trans,
-            # Cis > Trans suggests true dosage effect
-            'cis_minus_trans': corr_cis - corr_trans,
-            # Expression in different CNV states
-            'n_amplified': amp_cells.sum(),
-            'n_deleted': del_cells.sum(),
-            'expr_amplified': expr_amp,
-            'expr_deleted': expr_del,
-            'expr_neutral': expr_neutral,
-            'fc_amp_vs_neutral': fc_amp_vs_neutral,
-            'fc_del_vs_neutral': fc_del_vs_neutral,
-        })
-
-    df = pd.DataFrame(results)
-
-    # Significance: cis-correlation with proper multiple testing correction
-    from scipy.stats import false_discovery_control
-    if len(df) > 0 and 'cis_pval' in df.columns:
-        # FDR correction
-        df['cis_pval_adj'] = false_discovery_control(df['cis_pval'].values, method='bh')
-        df['significant_cis'] = df['cis_pval_adj'] < 0.05
-
-        # Strong cis-effect: significant AND positive correlation AND cis > trans
-        df['strong_cis_effect'] = (
-            (df['cis_pval_adj'] < 0.05) &
-            (df['cis_correlation'] > 0.1) &
-            (df['cis_minus_trans'] > 0)
+def load_contrastive_model(
+    model_dir: str = 'models/contrastive'
+) -> Tuple[torch.nn.Module, Dict]:
+    """Load trained contrastive model and normalization parameters."""
+    from importlib import import_module
+
+    model_path = os.path.join(model_dir, 'best_model.pt')
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(
+            f"No trained contrastive model found at {model_path}. "
+            "Run: python 07_contrastive_model.py --train"
         )
 
-    n_sig = df['significant_cis'].sum() if 'significant_cis' in df.columns else 0
-    n_strong = df['strong_cis_effect'].sum() if 'strong_cis_effect' in df.columns else 0
+    # Load checkpoint
+    checkpoint = torch.load(model_path, weights_only=False, map_location='cpu')
 
-    print(f"\nResults:")
-    print(f"  Chromosomes with significant cis-effects: {n_sig}")
-    print(f"  Chromosomes with STRONG cis-effects (cis > trans): {n_strong}")
+    # Import model class
+    contrastive_module = import_module('07_contrastive_model'.replace('.py', ''))
+    ContrastiveModel = contrastive_module.ContrastiveModel
 
-    return df
+    # Create model
+    model = ContrastiveModel(
+        expression_dim=checkpoint['expression_dim'],
+        cnv_dim=checkpoint['cnv_dim'],
+        latent_dim=checkpoint['latent_dim']
+    )
+    model.load_state_dict(checkpoint['model_state_dict'])
+    model.eval()
+
+    print(f"Loaded contrastive model from {model_path}")
+    print(f"  Expression dim: {checkpoint['expression_dim']}")
+    print(f"  CNV dim: {checkpoint['cnv_dim']}")
+    print(f"  Latent dim: {checkpoint['latent_dim']}")
+
+    return model, checkpoint.get('normalization', {})
 
 
-def analyze_gene_level_cis_effects(
+def compute_embedding_distances(
     adata: sc.AnnData,
-    top_n: int = 100
-) -> pd.DataFrame:
+    model: torch.nn.Module,
+    normalization: Dict,
+    batch_size: int = 256
+) -> np.ndarray:
     """
-    Analyze TRUE cis-effects at the individual gene level.
+    Compute embedding distance for each cell.
 
-    For each gene, correlate its expression with the CNV of ITS OWN chromosome,
-    not the global CNV score. This tests whether gene expression tracks
-    local copy number changes.
+    Distance = 1 - cosine_similarity(expression_embedding, cnv_embedding)
 
-    Genes with high positive cis-correlation are "dosage-sensitive".
-    Genes with no cis-correlation despite CNV changes are "dosage-compensated".
+    Low distance = CNV-concordant (expression matches CNV expectation)
+    High distance = CNV-discordant (expression deviates from CNV expectation)
+
+    Args:
+        adata: AnnData with expression in .X and CNV in .obsm['X_cnv']
+        model: Trained contrastive model
+        normalization: Dict with expression_mean, expression_std, cnv_mean, cnv_std
+        batch_size: Batch size for inference
 
     Returns:
-        DataFrame with per-gene cis-effect analysis
+        Array of embedding distances for each cell
     """
-    print("\nAnalyzing gene-level cis-effects...")
+    model.eval()
+    device = next(model.parameters()).device
 
-    if 'chromosome' not in adata.var.columns:
-        print("Warning: No chromosome info, skipping gene-level analysis")
+    # Get expression data
+    X = adata.X
+    if sparse.issparse(X):
+        X = X.toarray()
+    X = np.array(X, dtype=np.float32)
+
+    # Get CNV data
+    cnv = adata.obsm['X_cnv']
+    if sparse.issparse(cnv):
+        cnv = cnv.toarray()
+    cnv = np.array(cnv, dtype=np.float32)
+
+    # Normalize using training statistics
+    if normalization:
+        expr_mean = normalization.get('expression_mean', X.mean(axis=0))
+        expr_std = normalization.get('expression_std', X.std(axis=0)) + 1e-8
+        cnv_mean = normalization.get('cnv_mean', cnv.mean(axis=0))
+        cnv_std = normalization.get('cnv_std', cnv.std(axis=0)) + 1e-8
+
+        X = (X - expr_mean) / expr_std
+        cnv = (cnv - cnv_mean) / cnv_std
+
+    # Compute embeddings in batches
+    distances = []
+    n_cells = len(X)
+
+    with torch.no_grad():
+        for i in range(0, n_cells, batch_size):
+            batch_expr = torch.FloatTensor(X[i:i+batch_size]).to(device)
+            batch_cnv = torch.FloatTensor(cnv[i:i+batch_size]).to(device)
+
+            expr_embed, cnv_embed = model(batch_expr, batch_cnv)
+
+            # Cosine similarity (embeddings are already normalized)
+            similarity = (expr_embed * cnv_embed).sum(dim=1)
+
+            # Distance = 1 - similarity
+            batch_distances = (1 - similarity).cpu().numpy()
+            distances.append(batch_distances)
+
+    return np.concatenate(distances)
+
+
+def classify_concordance_cancer_only(
+    adata: sc.AnnData,
+    model: torch.nn.Module,
+    normalization: Dict,
+    method: str = 'quantile',
+    threshold_quantile: float = 0.25
+) -> sc.AnnData:
+    """
+    Classify CANCER cells as CNV-concordant or CNV-discordant based on embedding distance.
+
+    IMPORTANT: Thresholds are computed on cancer cells only to avoid bias from
+    normal cells which typically have lower embedding distances.
+
+    Args:
+        adata: AnnData object (should contain cancer_vs_normal column)
+        model: Trained contrastive model
+        normalization: Normalization parameters
+        method: 'quantile' or 'std' for threshold selection
+        threshold_quantile: For quantile method, cells below this quantile are concordant
+
+    Returns:
+        AnnData with 'embedding_distance' and 'cnv_concordance' columns added
+    """
+    print("\nComputing embedding distances for ALL cells...")
+    distances = compute_embedding_distances(adata, model, normalization)
+    adata.obs['embedding_distance'] = distances
+
+    # Filter to cancer cells for threshold computation
+    if 'cancer_vs_normal' in adata.obs.columns:
+        cancer_mask = adata.obs['cancer_vs_normal'] == 'Cancer'
+        n_cancer = cancer_mask.sum()
+        n_total = len(adata)
+        print(f"\nFiltering to CANCER cells only for concordance classification")
+        print(f"  Cancer cells: {n_cancer:,} / {n_total:,} ({100*n_cancer/n_total:.1f}%)")
+
+        cancer_distances = distances[cancer_mask]
+    else:
+        print("\nWarning: No 'cancer_vs_normal' column found, using all cells")
+        cancer_mask = np.ones(len(adata), dtype=bool)
+        cancer_distances = distances
+
+    # Classify cancer cells based on thresholds computed on cancer cells only
+    if method == 'quantile':
+        # Thresholds based on cancer cell distribution
+        low_thresh = np.quantile(cancer_distances, threshold_quantile)
+        high_thresh = np.quantile(cancer_distances, 1 - threshold_quantile)
+    else:
+        # Mean +/- 1 std of cancer cells
+        mean_dist = cancer_distances.mean()
+        std_dist = cancer_distances.std()
+        low_thresh = mean_dist - std_dist
+        high_thresh = mean_dist + std_dist
+
+    # Apply classification to all cells (but only cancer cells are meaningful)
+    concordance = np.where(
+        distances <= low_thresh, 'Concordant',
+        np.where(distances >= high_thresh, 'Discordant', 'Intermediate')
+    )
+
+    # Mark normal cells as 'Normal' in concordance column
+    if 'cancer_vs_normal' in adata.obs.columns:
+        normal_mask = adata.obs['cancer_vs_normal'] == 'Normal'
+        concordance[normal_mask] = 'Normal'
+
+    adata.obs['cnv_concordance'] = pd.Categorical(concordance)
+
+    # Summary (cancer cells only)
+    print(f"\nCNV Concordance Classification (method={method}, CANCER CELLS ONLY):")
+    print(f"  Distance thresholds: low={low_thresh:.3f}, high={high_thresh:.3f}")
+    print(f"  Cancer cell distance range: [{cancer_distances.min():.3f}, {cancer_distances.max():.3f}]")
+    print(f"  Cancer cell mean distance: {cancer_distances.mean():.3f} +/- {cancer_distances.std():.3f}")
+
+    for cat in ['Concordant', 'Intermediate', 'Discordant']:
+        n = ((adata.obs['cnv_concordance'] == cat) & cancer_mask).sum()
+        pct = 100 * n / cancer_mask.sum() if cancer_mask.sum() > 0 else 0
+        print(f"  {cat}: {n:,} cancer cells ({pct:.1f}%)")
+
+    if 'cancer_vs_normal' in adata.obs.columns:
+        n_normal = (adata.obs['cnv_concordance'] == 'Normal').sum()
+        print(f"  Normal cells (excluded): {n_normal:,}")
+
+    return adata
+
+
+def analyze_subcluster_composition(
+    adata: sc.AnnData
+) -> pd.DataFrame:
+    """
+    Analyze the composition of each CNV subcluster by concordance status.
+
+    This helps understand whether certain CNV patterns are more likely
+    to show concordant or discordant expression.
+
+    Args:
+        adata: AnnData with cnv_leiden and cnv_concordance columns
+
+    Returns:
+        DataFrame with subcluster composition analysis
+    """
+    print("\nAnalyzing subcluster composition by concordance...")
+
+    if 'cnv_concordance' not in adata.obs.columns:
+        print("  Warning: No cnv_concordance column, skipping")
         return pd.DataFrame()
 
-    # Get chromosome to CNV window mapping
-    chr_cnv_map = get_chromosome_cnv_mapping(adata)
-
-    # Get CNV matrix
-    cnv_matrix = adata.obsm['X_cnv']
-    if hasattr(cnv_matrix, 'toarray'):
-        cnv_matrix = cnv_matrix.toarray()
-
-    global_cnv = adata.obs['cnv_score'].values
+    # Filter to cancer cells
+    if 'cancer_vs_normal' in adata.obs.columns:
+        adata_cancer = adata[adata.obs['cancer_vs_normal'] == 'Cancer'].copy()
+    else:
+        adata_cancer = adata
 
     results = []
 
-    # Get expression matrix
-    X = adata.X
-    if hasattr(X, 'toarray'):
-        X = X.toarray()
+    for subcluster in adata_cancer.obs['cnv_leiden'].unique():
+        mask = adata_cancer.obs['cnv_leiden'] == subcluster
+        n_cells = mask.sum()
 
-    # Pre-compute per-chromosome CNV scores for efficiency
-    chrom_cnv_scores = {}
-    for chrom_key, (start_idx, end_idx) in chr_cnv_map.items():
-        chrom_cnv_scores[chrom_key] = cnv_matrix[:, start_idx:end_idx].mean(axis=1)
-
-    for i, gene in enumerate(adata.var_names):
-        gene_expr = X[:, i]
-        chrom = adata.var.loc[gene, 'chromosome']
-
-        # Skip genes with no variation
-        if gene_expr.std() < 1e-6:
+        if n_cells < 10:
             continue
 
-        # Normalize chromosome name
-        chrom_key = str(chrom).replace('chr', '') if pd.notna(chrom) else None
+        # Count by concordance
+        n_concordant = ((adata_cancer.obs['cnv_concordance'] == 'Concordant') & mask).sum()
+        n_intermediate = ((adata_cancer.obs['cnv_concordance'] == 'Intermediate') & mask).sum()
+        n_discordant = ((adata_cancer.obs['cnv_concordance'] == 'Discordant') & mask).sum()
 
-        # Get chromosome-specific CNV if available
-        if chrom_key and chrom_key in chrom_cnv_scores:
-            chrom_cnv = chrom_cnv_scores[chrom_key]
-            # TRUE CIS-EFFECT: correlate gene expression with its chromosome's CNV
-            corr_cis, pval_cis = stats.pearsonr(gene_expr, chrom_cnv)
-            # TRANS-EFFECT: correlate with global CNV for comparison
-            corr_trans, pval_trans = stats.pearsonr(gene_expr, global_cnv)
-            cnv_source = 'chromosome-specific'
-        else:
-            # Fallback to global CNV
-            corr_cis, pval_cis = stats.pearsonr(gene_expr, global_cnv)
-            corr_trans, pval_trans = corr_cis, pval_cis  # Same as cis
-            cnv_source = 'global'
+        # Mean embedding distance
+        mean_distance = adata_cancer.obs.loc[mask, 'embedding_distance'].mean()
+
+        # Mean CNV score
+        mean_cnv_score = adata_cancer.obs.loc[mask, 'cnv_score'].mean()
 
         results.append({
-            'gene': gene,
-            'chromosome': chrom,
-            'mean_expr': gene_expr.mean(),
-            'std_expr': gene_expr.std(),
-            'corr_cis': corr_cis,  # Correlation with own chromosome CNV
-            'pval_cis': pval_cis,
-            'corr_trans': corr_trans,  # Correlation with global CNV
-            'pval_trans': pval_trans,
-            'cis_minus_trans': corr_cis - corr_trans,  # Positive = true cis-effect
-            'cnv_source': cnv_source,
-            # Keep old name for backwards compatibility
-            'corr_with_cnv': corr_cis,
-            'pval': pval_cis
+            'subcluster': subcluster,
+            'n_cells': n_cells,
+            'n_concordant': n_concordant,
+            'n_intermediate': n_intermediate,
+            'n_discordant': n_discordant,
+            'pct_concordant': 100 * n_concordant / n_cells,
+            'pct_discordant': 100 * n_discordant / n_cells,
+            'mean_embedding_distance': mean_distance,
+            'mean_cnv_score': mean_cnv_score,
+            'concordance_ratio': n_concordant / (n_discordant + 1),  # +1 to avoid div by 0
         })
 
     df = pd.DataFrame(results)
 
     if len(df) > 0:
-        # FDR correction on cis p-values
-        from scipy.stats import false_discovery_control
-        df['pval_adj'] = false_discovery_control(df['pval_cis'].values, method='bh')
+        df = df.sort_values('pct_discordant', ascending=False)
 
-        # Classify genes based on CIS correlation (not global)
-        # Dosage-sensitive: significant positive cis-correlation
-        df['dosage_sensitive'] = (df['pval_adj'] < 0.05) & (df['corr_cis'] > 0.2)
-
-        # Dosage-compensated: no correlation despite being in CNV region
-        df['dosage_compensated'] = (df['pval_adj'] > 0.1) & (df['corr_cis'].abs() < 0.1)
-
-        # Strong cis-effect: cis correlation significantly exceeds trans
-        df['strong_cis_effect'] = (
-            (df['pval_adj'] < 0.05) &
-            (df['corr_cis'] > 0.15) &
-            (df['cis_minus_trans'] > 0.05)
-        )
-
-        # Sort by cis correlation
-        df = df.sort_values('corr_cis', ascending=False)
-
-        n_sensitive = df['dosage_sensitive'].sum()
-        n_compensated = df['dosage_compensated'].sum()
-        n_strong_cis = df['strong_cis_effect'].sum()
-        n_chr_specific = (df['cnv_source'] == 'chromosome-specific').sum()
-
-        print(f"  Genes with chromosome-specific CNV: {n_chr_specific:,}")
-        print(f"  Dosage-sensitive genes: {n_sensitive:,}")
-        print(f"  Dosage-compensated genes: {n_compensated:,}")
-        print(f"  Strong cis-effect genes (cis >> trans): {n_strong_cis:,}")
+        print(f"\n  Subclusters with highest discordance (regulatory escape):")
+        for _, row in df.head(5).iterrows():
+            print(f"    Subcluster {row['subcluster']}: {row['pct_discordant']:.1f}% discordant, "
+                  f"CNV={row['mean_cnv_score']:.3f}")
 
     return df
+
+
+def run_concordance_de_cancer_only(
+    adata: sc.AnnData,
+    method: str = 'wilcoxon',
+    within_subcluster: bool = False
+) -> pd.DataFrame:
+    """
+    Run DE between CNV-concordant and CNV-discordant CANCER cells.
+
+    This is the key analysis: genes that differ between concordant and discordant
+    cancer cells are involved in regulatory escape from CNV-driven expression changes.
+
+    Args:
+        adata: AnnData with 'cnv_concordance' column
+        method: DE method
+        within_subcluster: If True, run DE within each CNV subcluster separately
+
+    Returns:
+        DataFrame with DE results
+    """
+    if 'cnv_concordance' not in adata.obs.columns:
+        raise ValueError("Run classify_concordance_cancer_only() first")
+
+    # Filter to cancer cells with concordant/discordant classification
+    if 'cancer_vs_normal' in adata.obs.columns:
+        cancer_mask = adata.obs['cancer_vs_normal'] == 'Cancer'
+    else:
+        cancer_mask = np.ones(len(adata), dtype=bool)
+
+    concordance_mask = adata.obs['cnv_concordance'].isin(['Concordant', 'Discordant'])
+    combined_mask = cancer_mask & concordance_mask
+
+    adata_subset = adata[combined_mask].copy()
+
+    n_concordant = (adata_subset.obs['cnv_concordance'] == 'Concordant').sum()
+    n_discordant = (adata_subset.obs['cnv_concordance'] == 'Discordant').sum()
+
+    print(f"\nRunning Concordance DE Analysis (CANCER CELLS ONLY)")
+    print(f"  Concordant cancer cells: {n_concordant:,}")
+    print(f"  Discordant cancer cells: {n_discordant:,}")
+
+    if within_subcluster:
+        # Run DE within each subcluster, then combine
+        results = []
+        for subcluster in adata_subset.obs['cnv_leiden'].unique():
+            sub_mask = adata_subset.obs['cnv_leiden'] == subcluster
+            adata_sub = adata_subset[sub_mask].copy()
+
+            # Check we have enough cells in both groups
+            n_conc = (adata_sub.obs['cnv_concordance'] == 'Concordant').sum()
+            n_disc = (adata_sub.obs['cnv_concordance'] == 'Discordant').sum()
+
+            if n_conc < 10 or n_disc < 10:
+                continue
+
+            print(f"  Subcluster {subcluster}: {n_conc} concordant, {n_disc} discordant")
+
+            sc.tl.rank_genes_groups(
+                adata_sub,
+                groupby='cnv_concordance',
+                groups=['Discordant'],
+                reference='Concordant',
+                method=method,
+                pts=True,
+                corr_method='benjamini-hochberg'  # Use FDR instead of Bonferroni
+            )
+
+            df = sc.get.rank_genes_groups_df(adata_sub, group='Discordant')
+            df['subcluster'] = subcluster
+            df['comparison'] = f'Discordant_vs_Concordant_in_{subcluster}'
+            results.append(df)
+
+        if not results:
+            print("  Warning: No subclusters with enough cells in both groups")
+            return pd.DataFrame()
+
+        de_results = pd.concat(results, ignore_index=True)
+
+    else:
+        # Global comparison
+        sc.tl.rank_genes_groups(
+            adata_subset,
+            groupby='cnv_concordance',
+            groups=['Discordant'],
+            reference='Concordant',
+            method=method,
+            pts=True,
+            corr_method='benjamini-hochberg'  # Use FDR instead of Bonferroni
+        )
+
+        de_results = sc.get.rank_genes_groups_df(adata_subset, group='Discordant')
+        de_results['comparison'] = 'Discordant_vs_Concordant_CancerOnly'
+
+    # Add significance flags - both strict (FDR) and relaxed (raw p-value)
+    de_results['significant_fdr'] = (
+        (de_results['pvals_adj'] < 0.05) &
+        (np.abs(de_results['logfoldchanges']) > 0.5)
+    )
+
+    # Relaxed criteria using raw p-values (for exploratory analysis)
+    # This is appropriate when effect sizes are distributed across many genes
+    de_results['significant'] = (
+        (de_results['pvals'] < 0.01) &
+        (np.abs(de_results['logfoldchanges']) > 0.3)
+    )
+
+    n_sig_fdr = de_results['significant_fdr'].sum()
+    n_sig = de_results['significant'].sum()
+    n_up = ((de_results['significant']) & (de_results['logfoldchanges'] > 0)).sum()
+    n_down = ((de_results['significant']) & (de_results['logfoldchanges'] < 0)).sum()
+
+    print(f"\nResults:")
+    print(f"  Strict FDR significant (padj<0.05, |logFC|>0.5): {n_sig_fdr:,}")
+    print(f"  Relaxed significant (p<0.01, |logFC|>0.3): {n_sig:,}")
+    print(f"    Escape genes (up in Discordant): {n_up:,}")
+    print(f"    Compensation genes (down in Discordant): {n_down:,}")
+    print(f"  Note: Concordance effects are often distributed across many genes")
+
+    return de_results
+
+
+def analyze_escape_genes(
+    de_results: pd.DataFrame,
+    adata: sc.AnnData,
+    top_n: int = 50
+) -> pd.DataFrame:
+    """
+    Analyze the top escape genes (upregulated in discordant cells).
+
+    These genes are expressed higher than expected given the CNV state,
+    suggesting regulatory mechanisms that override dosage effects.
+
+    Args:
+        de_results: DE results from concordance analysis
+        adata: AnnData object
+        top_n: Number of top genes to analyze
+
+    Returns:
+        DataFrame with escape gene analysis
+    """
+    # Get upregulated genes using relaxed criteria OR top by score
+    # First try significant genes, then fall back to top by effect size
+    escape_genes = de_results[
+        (de_results['significant']) &
+        (de_results['logfoldchanges'] > 0)
+    ]
+
+    # If no significant genes, take top genes by score with positive logFC
+    if len(escape_genes) == 0:
+        escape_genes = de_results[de_results['logfoldchanges'] > 0.2].nlargest(top_n, 'scores')
+    else:
+        escape_genes = escape_genes.nlargest(top_n, 'scores')
+
+    if len(escape_genes) == 0:
+        return pd.DataFrame()
+
+    results = []
+    for _, row in escape_genes.iterrows():
+        gene = row['names']
+
+        gene_info = {
+            'gene': gene,
+            'logFC': row['logfoldchanges'],
+            'pval_adj': row['pvals_adj'],
+            'score': row['scores'],
+            'interpretation': 'Regulatory escape - expressed despite CNV expectation'
+        }
+
+        # Add chromosome info if available
+        if 'chromosome' in adata.var.columns and gene in adata.var_names:
+            gene_info['chromosome'] = adata.var.loc[gene, 'chromosome']
+
+        results.append(gene_info)
+
+    return pd.DataFrame(results)
+
+
+def analyze_compensation_genes(
+    de_results: pd.DataFrame,
+    adata: sc.AnnData,
+    top_n: int = 50
+) -> pd.DataFrame:
+    """
+    Analyze the top compensation genes (downregulated in discordant cells).
+
+    These genes are expressed lower than expected given the CNV state,
+    suggesting dosage compensation or epigenetic silencing mechanisms.
+
+    Args:
+        de_results: DE results from concordance analysis
+        adata: AnnData object
+        top_n: Number of top genes to analyze
+
+    Returns:
+        DataFrame with compensation gene analysis
+    """
+    # Get downregulated genes using relaxed criteria OR top by effect size
+    compensation_genes = de_results[
+        (de_results['significant']) &
+        (de_results['logfoldchanges'] < 0)
+    ]
+
+    # If no significant genes, take top genes by negative logFC
+    if len(compensation_genes) == 0:
+        compensation_genes = de_results[de_results['logfoldchanges'] < -0.2].nsmallest(top_n, 'logfoldchanges')
+    else:
+        compensation_genes = compensation_genes.nsmallest(top_n, 'logfoldchanges')
+
+    if len(compensation_genes) == 0:
+        return pd.DataFrame()
+
+    results = []
+    for _, row in compensation_genes.iterrows():
+        gene = row['names']
+
+        gene_info = {
+            'gene': gene,
+            'logFC': row['logfoldchanges'],
+            'pval_adj': row['pvals_adj'],
+            'score': row['scores'],
+            'interpretation': 'Dosage compensation - suppressed despite CNV expectation'
+        }
+
+        # Add chromosome info if available
+        if 'chromosome' in adata.var.columns and gene in adata.var_names:
+            gene_info['chromosome'] = adata.var.loc[gene, 'chromosome']
+
+        results.append(gene_info)
+
+    return pd.DataFrame(results)
 
 
 # ============================================================================
@@ -688,8 +628,8 @@ def plot_volcano(
     # Add legend
     from matplotlib.patches import Patch
     legend_elements = [
-        Patch(facecolor='red', label=f'Up (FC>{fc_threshold}, p<{pval_threshold})'),
-        Patch(facecolor='blue', label=f'Down (FC<-{fc_threshold}, p<{pval_threshold})'),
+        Patch(facecolor='red', label=f'Escape (FC>{fc_threshold}, p<{pval_threshold})'),
+        Patch(facecolor='blue', label=f'Compensation (FC<-{fc_threshold}, p<{pval_threshold})'),
         Patch(facecolor='gray', label='Not significant')
     ]
     ax.legend(handles=legend_elements, loc='upper right')
@@ -701,135 +641,249 @@ def plot_volcano(
     print(f"Saved: {output_path}")
 
 
-def plot_top_genes_heatmap(
+def plot_concordance_analysis(
     adata: sc.AnnData,
     de_results: pd.DataFrame,
-    groupby: str,
-    output_path: str,
-    top_n: int = 50,
-    title: str = 'Top DE Genes'
+    output_dir: str,
+    patient_id: str,
+    threshold_quantile: float = 0.25
 ):
-    """Plot heatmap of top DE genes."""
-    # Get top genes by significance
-    top_genes = de_results.nlargest(top_n, 'scores')['names'].values
+    """
+    Create visualization plots for concordance analysis.
 
-    # Subset to these genes
-    adata_subset = adata[:, [g for g in top_genes if g in adata.var_names]].copy()
+    Generates:
+    1. Embedding distance distribution (cancer cells only)
+    2. UMAP colored by concordance
+    3. Volcano plot for concordant vs discordant
+    4. Top escape/compensation genes
+    5. Subcluster composition
+    """
+    os.makedirs(output_dir, exist_ok=True)
 
-    # Plot
-    sc.pl.heatmap(
-        adata_subset,
-        var_names=adata_subset.var_names.tolist(),
-        groupby=groupby,
-        show=False,
-        save=False,
-        figsize=(12, 10)
-    )
+    # Filter to cancer cells for plots
+    if 'cancer_vs_normal' in adata.obs.columns:
+        cancer_mask = adata.obs['cancer_vs_normal'] == 'Cancer'
+    else:
+        cancer_mask = np.ones(len(adata), dtype=bool)
 
-    plt.suptitle(title)
+    # 1. Embedding distance distribution (cancer cells)
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    distances = adata.obs['embedding_distance']
+    cancer_distances = distances[cancer_mask]
+
+    # Histogram for cancer cells
+    axes[0].hist(cancer_distances, bins=50, edgecolor='black', alpha=0.7, color='coral')
+    axes[0].axvline(cancer_distances.quantile(threshold_quantile), color='green', linestyle='--',
+                    label=f'Q{int(threshold_quantile*100)} (Concordant threshold)')
+    axes[0].axvline(cancer_distances.quantile(1-threshold_quantile), color='red', linestyle='--',
+                    label=f'Q{int((1-threshold_quantile)*100)} (Discordant threshold)')
+    axes[0].set_xlabel('Embedding Distance')
+    axes[0].set_ylabel('Number of Cancer Cells')
+    axes[0].set_title(f'{patient_id}: Expression-CNV Embedding Distance\n(Cancer Cells Only)')
+    axes[0].legend()
+
+    # Box plot by concordance (cancer cells only)
+    concordance_order = ['Concordant', 'Intermediate', 'Discordant']
+    colors = {'Concordant': 'green', 'Intermediate': 'gray', 'Discordant': 'red'}
+
+    adata_cancer = adata[cancer_mask]
+    data_to_plot = [adata_cancer.obs.loc[adata_cancer.obs['cnv_concordance'] == cat, 'embedding_distance'].values
+                    for cat in concordance_order if cat in adata_cancer.obs['cnv_concordance'].values]
+    labels = [cat for cat in concordance_order if cat in adata_cancer.obs['cnv_concordance'].values]
+
+    bp = axes[1].boxplot(data_to_plot, labels=labels, patch_artist=True)
+    for patch, label in zip(bp['boxes'], labels):
+        patch.set_facecolor(colors.get(label, 'gray'))
+        patch.set_alpha(0.7)
+
+    axes[1].set_ylabel('Embedding Distance')
+    axes[1].set_title('Distance by Concordance Class\n(Cancer Cells Only)')
+
     plt.tight_layout()
-    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.savefig(os.path.join(output_dir, 'embedding_distance_distribution.png'),
+                dpi=150, bbox_inches='tight')
     plt.close()
+    print(f"Saved: {output_dir}/embedding_distance_distribution.png")
 
-    print(f"Saved: {output_path}")
+    # 2. UMAP colored by concordance (if UMAP exists)
+    if 'X_umap' in adata.obsm:
+        fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+
+        umap = adata.obsm['X_umap']
+
+        # By concordance (showing cancer cells, dimming normal)
+        for cat in concordance_order:
+            mask = adata.obs['cnv_concordance'] == cat
+            if mask.sum() > 0:
+                axes[0].scatter(umap[mask, 0], umap[mask, 1],
+                               c=colors.get(cat, 'gray'), label=cat, s=5, alpha=0.6)
+        # Add normal cells in background
+        if 'cancer_vs_normal' in adata.obs.columns:
+            normal_mask = adata.obs['cancer_vs_normal'] == 'Normal'
+            axes[0].scatter(umap[normal_mask, 0], umap[normal_mask, 1],
+                           c='lightblue', label='Normal', s=3, alpha=0.2)
+        axes[0].set_xlabel('UMAP1')
+        axes[0].set_ylabel('UMAP2')
+        axes[0].set_title('UMAP by CNV Concordance\n(Cancer Cells)')
+        axes[0].legend(markerscale=3)
+
+        # By embedding distance (continuous, cancer cells only)
+        sc_dist = axes[1].scatter(umap[cancer_mask, 0], umap[cancer_mask, 1],
+                                  c=distances[cancer_mask], cmap='RdYlGn_r', s=5, alpha=0.5)
+        plt.colorbar(sc_dist, ax=axes[1], label='Embedding Distance')
+        axes[1].set_xlabel('UMAP1')
+        axes[1].set_ylabel('UMAP2')
+        axes[1].set_title('UMAP by Embedding Distance\n(Cancer Cells)')
+
+        # By cancer vs normal
+        if 'cancer_vs_normal' in adata.obs.columns:
+            for cat, color in [('Cancer', 'red'), ('Normal', 'blue')]:
+                mask = adata.obs['cancer_vs_normal'] == cat
+                if mask.sum() > 0:
+                    axes[2].scatter(umap[mask, 0], umap[mask, 1],
+                                   c=color, label=cat, s=5, alpha=0.5)
+            axes[2].set_xlabel('UMAP1')
+            axes[2].set_ylabel('UMAP2')
+            axes[2].set_title('UMAP by Cancer Status')
+            axes[2].legend(markerscale=3)
+
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, 'umap_concordance.png'),
+                    dpi=150, bbox_inches='tight')
+        plt.close()
+        print(f"Saved: {output_dir}/umap_concordance.png")
+
+    # 3. Volcano plot for concordance DE
+    if not de_results.empty and 'logfoldchanges' in de_results.columns:
+        plot_volcano(
+            de_results,
+            os.path.join(output_dir, 'volcano_concordance.png'),
+            title=f'{patient_id}: Discordant vs Concordant Cancer Cells\n(+) = Escape genes, (-) = Compensation genes'
+        )
+
+    # 4. Top genes bar plot
+    if not de_results.empty:
+        fig, axes = plt.subplots(1, 2, figsize=(14, 8))
+
+        # Top escape genes (up in discordant)
+        escape = de_results[
+            (de_results['significant']) &
+            (de_results['logfoldchanges'] > 0)
+        ].nlargest(20, 'scores')
+
+        if len(escape) > 0:
+            axes[0].barh(range(len(escape)), escape['logfoldchanges'].values, color='red', alpha=0.7)
+            axes[0].set_yticks(range(len(escape)))
+            axes[0].set_yticklabels(escape['names'].values)
+            axes[0].set_xlabel('Log2 Fold Change')
+            axes[0].set_title('Top Escape Genes\n(Higher in Discordant = Regulatory Escape)')
+            axes[0].invert_yaxis()
+
+        # Top compensation genes (down in discordant)
+        compensation = de_results[
+            (de_results['significant']) &
+            (de_results['logfoldchanges'] < 0)
+        ].nsmallest(20, 'logfoldchanges')
+
+        if len(compensation) > 0:
+            axes[1].barh(range(len(compensation)),
+                        compensation['logfoldchanges'].values, color='blue', alpha=0.7)
+            axes[1].set_yticks(range(len(compensation)))
+            axes[1].set_yticklabels(compensation['names'].values)
+            axes[1].set_xlabel('Log2 Fold Change')
+            axes[1].set_title('Top Compensation Genes\n(Lower in Discordant = Dosage Compensation)')
+            axes[1].invert_yaxis()
+
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, 'top_concordance_genes.png'),
+                    dpi=150, bbox_inches='tight')
+        plt.close()
+        print(f"Saved: {output_dir}/top_concordance_genes.png")
 
 
-def plot_chromosome_effects(
-    chrom_results: pd.DataFrame,
-    output_path: str
+def plot_subcluster_composition(
+    composition_df: pd.DataFrame,
+    output_dir: str,
+    patient_id: str
 ):
-    """Plot chromosome-level cis-effect analysis."""
-    if chrom_results.empty:
+    """Plot subcluster composition by concordance status."""
+    if composition_df.empty:
         return
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 6))
 
-    # Sort chromosomes
-    def chrom_sort_key(x):
-        x = str(x).replace('chr', '')
-        if x == 'X':
-            return 23
-        elif x == 'Y':
-            return 24
-        else:
-            try:
-                return int(x)
-            except:
-                return 99
+    # Sort by discordance percentage
+    df = composition_df.sort_values('pct_discordant', ascending=True)
 
-    chrom_results = chrom_results.sort_values('chromosome', key=lambda x: x.map(chrom_sort_key))
+    # Stacked bar chart
+    x = range(len(df))
+    width = 0.8
 
-    # Plot 1: Cis-correlation (chr X expression vs chr X CNV)
-    if 'cis_correlation' in chrom_results.columns:
-        colors = ['red' if (p < 0.05 and c > 0) else 'blue' if (p < 0.05 and c < 0) else 'gray'
-                  for p, c in zip(chrom_results['cis_pval'], chrom_results['cis_correlation'])]
-        axes[0].bar(range(len(chrom_results)), chrom_results['cis_correlation'], color=colors)
-        axes[0].set_ylabel('Cis-Correlation (Chr Expression vs Chr CNV)')
-        axes[0].set_title('Cis-Effects: Same-Chromosome Expression-CNV Correlation')
-    else:
-        # Fallback to old format
-        colors = ['red' if p < 0.05 else 'gray' for p in chrom_results.get('corr_pval', [0.1]*len(chrom_results))]
-        axes[0].bar(range(len(chrom_results)), chrom_results.get('corr_expr_cnv', [0]*len(chrom_results)), color=colors)
-        axes[0].set_ylabel('Correlation (Expression vs CNV)')
-        axes[0].set_title('Expression-CNV Correlation by Chromosome')
+    axes[0].barh(x, df['pct_concordant'], width, label='Concordant', color='green', alpha=0.7)
+    axes[0].barh(x, df['pct_discordant'], width, left=df['pct_concordant'] + (100 - df['pct_concordant'] - df['pct_discordant']),
+                 label='Discordant', color='red', alpha=0.7)
+    axes[0].barh(x, 100 - df['pct_concordant'] - df['pct_discordant'], width,
+                 left=df['pct_concordant'], label='Intermediate', color='gray', alpha=0.5)
 
-    axes[0].set_xticks(range(len(chrom_results)))
-    axes[0].set_xticklabels(chrom_results['chromosome'], rotation=45)
-    axes[0].set_xlabel('Chromosome')
-    axes[0].axhline(0, color='black', linestyle='-', alpha=0.3)
+    axes[0].set_yticks(x)
+    axes[0].set_yticklabels([f"Cluster {c}" for c in df['subcluster']])
+    axes[0].set_xlabel('Percentage of Cancer Cells')
+    axes[0].set_title(f'{patient_id}: Subcluster Composition by Concordance')
+    axes[0].legend(loc='lower right')
 
-    # Plot 2: Cis vs Trans comparison OR fold change
-    if 'cis_minus_trans' in chrom_results.columns:
-        # Show cis - trans difference (positive = true cis-effect)
-        colors = ['green' if d > 0.05 else 'gray' for d in chrom_results['cis_minus_trans']]
-        axes[1].bar(range(len(chrom_results)), chrom_results['cis_minus_trans'], color=colors)
-        axes[1].set_ylabel('Cis - Trans Correlation')
-        axes[1].set_title('Cis-Specificity (Positive = True Dosage Effect)')
-    elif 'fc_amp_vs_neutral' in chrom_results.columns:
-        # Show fold change for amplified regions
-        fc_values = chrom_results['fc_amp_vs_neutral'].fillna(1)
-        colors = ['red' if fc > 1.1 else 'blue' if fc < 0.9 else 'gray' for fc in fc_values]
-        axes[1].bar(range(len(chrom_results)), np.log2(fc_values), color=colors)
-        axes[1].set_ylabel('Log2 FC (Amplified vs Neutral)')
-        axes[1].set_title('Expression in Amplified Regions')
-    else:
-        # Fallback
-        fc_values = chrom_results.get('fold_change', [1]*len(chrom_results))
-        colors = ['red' if fc > 1.1 else 'blue' if fc < 0.9 else 'gray' for fc in fc_values]
-        axes[1].bar(range(len(chrom_results)), np.log2(fc_values), color=colors)
-        axes[1].set_ylabel('Log2 Fold Change')
-        axes[1].set_title('Expression Fold Change by Chromosome')
+    # Scatter: CNV score vs discordance
+    axes[1].scatter(df['mean_cnv_score'], df['pct_discordant'],
+                    s=df['n_cells']/10, alpha=0.6, c='coral')
+    axes[1].set_xlabel('Mean CNV Score')
+    axes[1].set_ylabel('% Discordant Cells')
+    axes[1].set_title('CNV Burden vs Regulatory Discordance\n(bubble size = number of cells)')
 
-    axes[1].set_xticks(range(len(chrom_results)))
-    axes[1].set_xticklabels(chrom_results['chromosome'], rotation=45)
-    axes[1].set_xlabel('Chromosome')
-    axes[1].axhline(0, color='black', linestyle='-', alpha=0.3)
+    # Add cluster labels
+    for _, row in df.iterrows():
+        axes[1].annotate(f"{row['subcluster']}",
+                        (row['mean_cnv_score'], row['pct_discordant']),
+                        fontsize=8, alpha=0.7)
 
     plt.tight_layout()
-    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.savefig(os.path.join(output_dir, 'subcluster_composition.png'),
+                dpi=150, bbox_inches='tight')
     plt.close()
-
-    print(f"Saved: {output_path}")
+    print(f"Saved: {output_dir}/subcluster_composition.png")
 
 
 # ============================================================================
 # Main Pipeline
 # ============================================================================
 
-def run_de_pipeline(
+def run_concordance_pipeline(
     patient_id: str,
     cnv_dir: str = 'data/cnv_output',
-    output_dir: str = 'data/de_results'
+    model_dir: str = 'models/contrastive',
+    output_dir: str = 'data/de_results',
+    threshold_quantile: float = 0.25
 ) -> Dict[str, pd.DataFrame]:
     """
-    Run complete DE analysis pipeline for a patient.
+    Run the concordance-based DE analysis pipeline for CANCER CELLS ONLY.
+
+    This is the main analysis that leverages the contrastive embedding space
+    to identify genes involved in regulatory escape from CNV effects in cancer.
+
+    Args:
+        patient_id: Patient identifier
+        cnv_dir: Directory with CNV results
+        model_dir: Directory with trained contrastive model
+        output_dir: Output directory
 
     Returns:
-        Dictionary of DE result DataFrames
+        Dictionary of result DataFrames
     """
-    print("=" * 60)
-    print(f"Differential Expression Analysis: {patient_id}")
-    print("=" * 60)
+    print("=" * 70)
+    print(f"CONCORDANCE-BASED DE ANALYSIS (CANCER CELLS ONLY): {patient_id}")
+    print("=" * 70)
+    print("\nFocus: Identifying compensation mechanisms in cancer cells")
+    print("       Comparing CNV-concordant vs CNV-discordant cancer cells")
+    print(f"       Threshold: {int(threshold_quantile*100)}/{int((1-threshold_quantile)*100)} percentile split")
 
     # Create output directory
     patient_output = os.path.join(output_dir, patient_id)
@@ -838,115 +892,124 @@ def run_de_pipeline(
     # Load data
     adata = load_cnv_data(patient_id, cnv_dir)
 
-    # Create CNV groups
-    adata = create_cnv_groups(adata, n_groups=2)
+    # Load contrastive model
+    try:
+        model, normalization = load_contrastive_model(model_dir)
+    except FileNotFoundError as e:
+        print(f"\nError: {e}")
+        print("Cannot run concordance analysis without trained contrastive model.")
+        print("Run: python 07_contrastive_model.py --train")
+        return {}
 
     results = {}
 
-    # 1. High vs Low CNV
-    print("\n" + "-" * 40)
-    print("Analysis 1: High vs Low CNV")
-    print("-" * 40)
+    # Classify cells by concordance (cancer cells only)
+    print("\n" + "-" * 50)
+    print("Step 1: Classify CNV Concordance (Cancer Cells Only)")
+    print("-" * 50)
 
-    de_cnv = run_high_vs_low_cnv(adata)
-    if not de_cnv.empty:
-        results['high_vs_low_cnv'] = de_cnv
-        de_cnv.to_csv(os.path.join(patient_output, 'de_high_vs_low_cnv.csv'), index=False)
+    adata = classify_concordance_cancer_only(adata, model, normalization, threshold_quantile=threshold_quantile)
 
-        plot_volcano(
-            de_cnv,
-            os.path.join(patient_output, 'volcano_high_vs_low_cnv.png'),
-            title=f'{patient_id}: High vs Low CNV'
+    # Save concordance classification
+    concordance_df = adata.obs[['embedding_distance', 'cnv_concordance']].copy()
+    if 'cancer_vs_normal' in adata.obs.columns:
+        concordance_df['cancer_vs_normal'] = adata.obs['cancer_vs_normal']
+    concordance_df.to_csv(os.path.join(patient_output, 'cell_concordance.csv'))
+    print(f"Saved: {patient_output}/cell_concordance.csv")
+
+    # Analyze subcluster composition
+    print("\n" + "-" * 50)
+    print("Step 2: Analyze Subcluster Composition")
+    print("-" * 50)
+
+    composition_df = analyze_subcluster_composition(adata)
+    if not composition_df.empty:
+        composition_df.to_csv(os.path.join(patient_output, 'subcluster_composition.csv'), index=False)
+        results['subcluster_composition'] = composition_df
+
+    # Run concordance DE (main analysis - cancer cells only)
+    print("\n" + "-" * 50)
+    print("Step 3: Concordant vs Discordant DE (Cancer Cells)")
+    print("-" * 50)
+
+    de_concordance = run_concordance_de_cancer_only(adata, within_subcluster=False)
+    if not de_concordance.empty:
+        results['concordance_de'] = de_concordance
+        de_concordance.to_csv(
+            os.path.join(patient_output, 'de_concordant_vs_discordant.csv'),
+            index=False
         )
 
-    # 2. Cancer vs Normal
-    print("\n" + "-" * 40)
-    print("Analysis 2: Cancer vs Normal")
-    print("-" * 40)
-
-    if 'Normal' in adata.obs['cancer_vs_normal'].values:
-        de_cancer = run_cancer_vs_normal(adata)
-        if not de_cancer.empty:
-            results['cancer_vs_normal'] = de_cancer
-            de_cancer.to_csv(os.path.join(patient_output, 'de_cancer_vs_normal.csv'), index=False)
-
-            plot_volcano(
-                de_cancer,
-                os.path.join(patient_output, 'volcano_cancer_vs_normal.png'),
-                title=f'{patient_id}: Cancer vs Normal'
+        # Analyze escape and compensation genes
+        escape_genes = analyze_escape_genes(de_concordance, adata)
+        if not escape_genes.empty:
+            escape_genes.to_csv(
+                os.path.join(patient_output, 'escape_genes.csv'),
+                index=False
             )
-    else:
-        print("Skipping: No normal cells in dataset")
+            results['escape_genes'] = escape_genes
+            print(f"  Escape genes saved: {len(escape_genes)}")
 
-    # 3. Top CNV subclusters
-    print("\n" + "-" * 40)
-    print("Analysis 3: Top CNV Subclusters")
-    print("-" * 40)
+        compensation_genes = analyze_compensation_genes(de_concordance, adata)
+        if not compensation_genes.empty:
+            compensation_genes.to_csv(
+                os.path.join(patient_output, 'compensation_genes.csv'),
+                index=False
+            )
+            results['compensation_genes'] = compensation_genes
+            print(f"  Compensation genes saved: {len(compensation_genes)}")
 
-    de_clusters = run_subcluster_de(adata, top_n_clusters=3)
-    if not de_clusters.empty:
-        results['cnv_subclusters'] = de_clusters
-        de_clusters.to_csv(os.path.join(patient_output, 'de_cnv_subclusters.csv'), index=False)
+    # Run within-subcluster concordance DE
+    print("\n" + "-" * 50)
+    print("Step 4: Within-Subcluster Concordance DE")
+    print("-" * 50)
 
-    # 4. Chromosome-level cis-effects
-    print("\n" + "-" * 40)
-    print("Analysis 4: Chromosome-level cis-effects")
-    print("-" * 40)
-
-    chrom_results = analyze_cnv_regions(adata)
-    if not chrom_results.empty:
-        results['chromosome_cis_effects'] = chrom_results
-        chrom_results.to_csv(os.path.join(patient_output, 'chromosome_cis_effects.csv'), index=False)
-
-        plot_chromosome_effects(
-            chrom_results,
-            os.path.join(patient_output, 'chromosome_cis_effects.png')
+    de_within = run_concordance_de_cancer_only(adata, within_subcluster=True)
+    if not de_within.empty:
+        results['concordance_de_within_subcluster'] = de_within
+        de_within.to_csv(
+            os.path.join(patient_output, 'de_concordance_within_subcluster.csv'),
+            index=False
         )
 
-    # 5. Gene-level cis-effects (dosage sensitivity)
-    print("\n" + "-" * 40)
-    print("Analysis 5: Gene-level dosage sensitivity")
-    print("-" * 40)
+    # Generate plots
+    print("\n" + "-" * 50)
+    print("Step 5: Generate Visualizations")
+    print("-" * 50)
 
-    gene_cis = analyze_gene_level_cis_effects(adata)
-    if not gene_cis.empty:
-        results['gene_cis_effects'] = gene_cis
-        gene_cis.to_csv(os.path.join(patient_output, 'gene_dosage_sensitivity.csv'), index=False)
+    plot_concordance_analysis(
+        adata,
+        de_concordance if not de_concordance.empty else pd.DataFrame(),
+        patient_output,
+        patient_id,
+        threshold_quantile=threshold_quantile
+    )
 
-        # Save top dosage-sensitive genes separately
-        sensitive = gene_cis[gene_cis['dosage_sensitive'] == True]
-        if len(sensitive) > 0:
-            sensitive.to_csv(os.path.join(patient_output, 'dosage_sensitive_genes.csv'), index=False)
-            print(f"  Top dosage-sensitive genes saved")
+    if not composition_df.empty:
+        plot_subcluster_composition(composition_df, patient_output, patient_id)
 
     # Summary
-    print("\n" + "=" * 60)
-    print("DE ANALYSIS COMPLETE")
-    print("=" * 60)
+    print("\n" + "=" * 70)
+    print("CONCORDANCE ANALYSIS COMPLETE (CANCER CELLS ONLY)")
+    print("=" * 70)
     print(f"\nOutput directory: {patient_output}")
-    print("\nFiles generated:")
-    for name, df in results.items():
-        n_sig = df['significant'].sum() if 'significant' in df.columns else len(df)
-        print(f"  {name}: {n_sig:,} significant")
+    print("\nKey findings:")
+
+    if 'concordance_de' in results:
+        df = results['concordance_de']
+        n_sig = df['significant'].sum()
+        n_escape = ((df['significant']) & (df['logfoldchanges'] > 0)).sum()
+        n_comp = ((df['significant']) & (df['logfoldchanges'] < 0)).sum()
+        print(f"  Total significant genes: {n_sig:,}")
+        print(f"  Escape genes (up in discordant): {n_escape:,}")
+        print(f"  Compensation genes (down in discordant): {n_comp:,}")
 
     return results
 
 
-def get_available_patients(cnv_dir: str = 'data/cnv_output') -> List[str]:
-    """Get list of patients with CNV data."""
-    patients = []
-    if os.path.exists(cnv_dir):
-        for name in os.listdir(cnv_dir):
-            if name.startswith('P') and os.path.isdir(os.path.join(cnv_dir, name)):
-                cnv_file = os.path.join(cnv_dir, name, f'{name}_cnv.h5ad')
-                if os.path.exists(cnv_file):
-                    patients.append(name)
-    return sorted(patients)
-
-
 def main():
     parser = argparse.ArgumentParser(
-        description='Run differential expression analysis based on CNV status'
+        description='Run concordance-based DE analysis for cancer cells (compensation mechanisms)'
     )
     parser.add_argument(
         '--patient',
@@ -966,10 +1029,22 @@ def main():
         help='Directory with CNV results'
     )
     parser.add_argument(
+        '--model-dir',
+        type=str,
+        default='models/contrastive',
+        help='Directory with trained contrastive model'
+    )
+    parser.add_argument(
         '--output-dir',
         type=str,
         default='data/de_results',
         help='Output directory for DE results'
+    )
+    parser.add_argument(
+        '--threshold',
+        type=float,
+        default=0.25,
+        help='Quantile threshold for concordance classification (default: 0.25 means 25/75 split). Use 0.10 for more extreme 10/90 split.'
     )
 
     args = parser.parse_args()
@@ -995,12 +1070,15 @@ def main():
     all_results = {}
     for patient_id in patient_ids:
         try:
-            results = run_de_pipeline(
+            results = run_concordance_pipeline(
                 patient_id,
                 cnv_dir=args.cnv_dir,
-                output_dir=args.output_dir
+                model_dir=args.model_dir,
+                output_dir=args.output_dir,
+                threshold_quantile=args.threshold
             )
             all_results[patient_id] = results
+
         except Exception as e:
             print(f"Error analyzing {patient_id}: {e}")
             import traceback
@@ -1009,9 +1087,9 @@ def main():
 
     # Summary across patients
     if len(all_results) > 1:
-        print("\n" + "=" * 60)
+        print("\n" + "=" * 70)
         print("CROSS-PATIENT SUMMARY")
-        print("=" * 60)
+        print("=" * 70)
 
         for patient_id, results in all_results.items():
             print(f"\n{patient_id}:")
@@ -1019,6 +1097,38 @@ def main():
                 if 'significant' in df.columns:
                     n_sig = df['significant'].sum()
                     print(f"  {name}: {n_sig:,} significant genes")
+
+    # Print interpretation guide
+    print("\n" + "=" * 70)
+    print("INTERPRETATION GUIDE")
+    print("=" * 70)
+    print("""
+This analysis identifies genes involved in regulatory escape from CNV effects
+in CANCER CELLS ONLY. Normal cells are excluded to focus on tumor-specific
+compensation mechanisms.
+
+ESCAPE GENES (upregulated in discordant cancer cells):
+  - Expressed HIGHER than expected given the CNV state
+  - May indicate: transcriptional compensation, alternative regulation,
+    or genes that escape CNV-driven silencing
+  - Potential biomarkers of treatment resistance or metastatic potential
+
+COMPENSATION GENES (downregulated in discordant cancer cells):
+  - Expressed LOWER than expected given the CNV state
+  - May indicate: dosage compensation, epigenetic silencing,
+    or buffering mechanisms
+  - Could represent therapeutic vulnerabilities
+
+Key files generated:
+  - de_concordant_vs_discordant.csv: Full DE results (cancer cells only)
+  - escape_genes.csv: Top genes escaping CNV effects
+  - compensation_genes.csv: Top genes showing dosage compensation
+  - cell_concordance.csv: Per-cell concordance classification
+  - subcluster_composition.csv: Concordance breakdown by CNV subcluster
+
+For standard DE analyses (cancer vs normal, high vs low CNV, etc.),
+run: python 08b_standard_de.py
+""")
 
 
 if __name__ == "__main__":

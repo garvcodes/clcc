@@ -66,4 +66,26 @@ models/
 
 # Local config
 .env
+
+# Results (regeneratable)
 data/de_results/
+results/
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+
+# Large data files
+*.csv.gz
+*.tsv.gz
+*.pkl
+*.pickle
+
+# Notebook outputs
+*.nbconvert.*
+
+# Cluster job files
+*.out
+*.err
+slurm-*.out

@@ -625,6 +625,290 @@ def extract_embeddings(
     return np.vstack(exp_embeds), np.vstack(cnv_embeds)
 
 
+def visualize_embedding_space(
+    model: ContrastiveModel,
+    dataset: ExpressionCNVDataset,
+    device: torch.device,
+    output_dir: str,
+    method: str = 'umap',
+    sample_size: Optional[int] = None
+):
+    """
+    Visualize the entire embedding space after training.
+
+    Creates visualizations showing:
+    1. Expression and CNV embeddings in shared space (colored by modality)
+    2. Embeddings colored by cancer vs normal status
+    3. Embeddings colored by CNV subcluster
+    4. Embedding distance distribution
+    5. Alignment quality (lines connecting matched pairs)
+
+    Args:
+        model: Trained contrastive model
+        dataset: Dataset to visualize
+        device: Torch device
+        output_dir: Directory to save plots
+        method: Dimensionality reduction method ('umap' or 'pca')
+        sample_size: Optional limit on number of cells to visualize
+    """
+    import matplotlib.pyplot as plt
+    from sklearn.decomposition import PCA
+
+    try:
+        import umap
+        UMAP_AVAILABLE = True
+    except ImportError:
+        UMAP_AVAILABLE = False
+        if method == 'umap':
+            print("UMAP not available, falling back to PCA")
+            method = 'pca'
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    print("\nExtracting embeddings for visualization...")
+    exp_embeds, cnv_embeds = extract_embeddings(model, dataset, device)
+
+    # Get metadata
+    metadata = dataset.metadata
+
+    # Optionally subsample for faster visualization
+    n_cells = len(exp_embeds)
+    if sample_size and sample_size < n_cells:
+        np.random.seed(42)
+        idx = np.random.choice(n_cells, sample_size, replace=False)
+        exp_embeds = exp_embeds[idx]
+        cnv_embeds = cnv_embeds[idx]
+        metadata = metadata.iloc[idx]
+        print(f"Subsampled to {sample_size} cells for visualization")
+
+    n_viz = len(exp_embeds)
+
+    # Combine embeddings for joint dimensionality reduction
+    combined = np.vstack([exp_embeds, cnv_embeds])
+    modality_labels = ['Expression'] * n_viz + ['CNV'] * n_viz
+
+    # Dimensionality reduction
+    print(f"Running {method.upper()} dimensionality reduction...")
+    if method == 'umap':
+        reducer = umap.UMAP(n_components=2, random_state=42, n_neighbors=30, min_dist=0.3)
+        coords_2d = reducer.fit_transform(combined)
+    else:
+        reducer = PCA(n_components=2, random_state=42)
+        coords_2d = reducer.fit_transform(combined)
+
+    exp_coords = coords_2d[:n_viz]
+    cnv_coords = coords_2d[n_viz:]
+
+    # Calculate embedding distances (1 - cosine similarity)
+    similarities = (exp_embeds * cnv_embeds).sum(axis=1)
+    distances = 1 - similarities
+
+    # -------------------------------------------------------------------------
+    # Plot 1: Expression vs CNV embeddings (by modality)
+    # -------------------------------------------------------------------------
+    fig, ax = plt.subplots(figsize=(10, 8))
+
+    ax.scatter(exp_coords[:, 0], exp_coords[:, 1], c='blue', alpha=0.5, s=10, label='Expression')
+    ax.scatter(cnv_coords[:, 0], cnv_coords[:, 1], c='red', alpha=0.5, s=10, label='CNV')
+
+    ax.set_xlabel(f'{method.upper()}1')
+    ax.set_ylabel(f'{method.upper()}2')
+    ax.set_title('Embedding Space: Expression vs CNV Modalities')
+    ax.legend(markerscale=3)
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'embedding_by_modality.png'), dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Saved: {output_dir}/embedding_by_modality.png")
+
+    # -------------------------------------------------------------------------
+    # Plot 2: Embeddings colored by cancer vs normal
+    # -------------------------------------------------------------------------
+    if 'cancer_vs_normal' in metadata.columns:
+        fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+
+        cancer_mask = metadata['cancer_vs_normal'].values == 'Cancer'
+
+        # Expression embeddings
+        for label, mask, color in [('Normal', ~cancer_mask, 'blue'), ('Cancer', cancer_mask, 'red')]:
+            if mask.sum() > 0:
+                axes[0].scatter(exp_coords[mask, 0], exp_coords[mask, 1],
+                               c=color, alpha=0.5, s=10, label=label)
+        axes[0].set_xlabel(f'{method.upper()}1')
+        axes[0].set_ylabel(f'{method.upper()}2')
+        axes[0].set_title('Expression Embeddings: Cancer vs Normal')
+        axes[0].legend(markerscale=3)
+
+        # CNV embeddings
+        for label, mask, color in [('Normal', ~cancer_mask, 'blue'), ('Cancer', cancer_mask, 'red')]:
+            if mask.sum() > 0:
+                axes[1].scatter(cnv_coords[mask, 0], cnv_coords[mask, 1],
+                               c=color, alpha=0.5, s=10, label=label)
+        axes[1].set_xlabel(f'{method.upper()}1')
+        axes[1].set_ylabel(f'{method.upper()}2')
+        axes[1].set_title('CNV Embeddings: Cancer vs Normal')
+        axes[1].legend(markerscale=3)
+
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, 'embedding_cancer_vs_normal.png'), dpi=150, bbox_inches='tight')
+        plt.close()
+        print(f"Saved: {output_dir}/embedding_cancer_vs_normal.png")
+
+    # -------------------------------------------------------------------------
+    # Plot 3: Embeddings colored by CNV subcluster
+    # -------------------------------------------------------------------------
+    if 'cnv_leiden' in metadata.columns:
+        fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+
+        subclusters = metadata['cnv_leiden'].values
+        n_clusters = len(np.unique(subclusters))
+        cmap = plt.cm.get_cmap('tab20', n_clusters)
+
+        sc1 = axes[0].scatter(exp_coords[:, 0], exp_coords[:, 1],
+                              c=subclusters.astype(int), cmap=cmap, alpha=0.5, s=10)
+        axes[0].set_xlabel(f'{method.upper()}1')
+        axes[0].set_ylabel(f'{method.upper()}2')
+        axes[0].set_title('Expression Embeddings: CNV Subclusters')
+        plt.colorbar(sc1, ax=axes[0], label='Subcluster')
+
+        sc2 = axes[1].scatter(cnv_coords[:, 0], cnv_coords[:, 1],
+                              c=subclusters.astype(int), cmap=cmap, alpha=0.5, s=10)
+        axes[1].set_xlabel(f'{method.upper()}1')
+        axes[1].set_ylabel(f'{method.upper()}2')
+        axes[1].set_title('CNV Embeddings: CNV Subclusters')
+        plt.colorbar(sc2, ax=axes[1], label='Subcluster')
+
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, 'embedding_by_subcluster.png'), dpi=150, bbox_inches='tight')
+        plt.close()
+        print(f"Saved: {output_dir}/embedding_by_subcluster.png")
+
+    # -------------------------------------------------------------------------
+    # Plot 4: Embedding distance distribution
+    # -------------------------------------------------------------------------
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    # Histogram of distances
+    axes[0].hist(distances, bins=50, edgecolor='black', alpha=0.7)
+    axes[0].axvline(np.median(distances), color='red', linestyle='--',
+                    label=f'Median: {np.median(distances):.3f}')
+    axes[0].set_xlabel('Embedding Distance (1 - cosine similarity)')
+    axes[0].set_ylabel('Number of Cells')
+    axes[0].set_title('Expression-CNV Embedding Distance Distribution')
+    axes[0].legend()
+
+    # Distance by cancer vs normal
+    if 'cancer_vs_normal' in metadata.columns:
+        cancer_mask = metadata['cancer_vs_normal'].values == 'Cancer'
+        axes[1].hist(distances[~cancer_mask], bins=30, alpha=0.6, label='Normal', color='blue')
+        axes[1].hist(distances[cancer_mask], bins=30, alpha=0.6, label='Cancer', color='red')
+        axes[1].set_xlabel('Embedding Distance')
+        axes[1].set_ylabel('Number of Cells')
+        axes[1].set_title('Embedding Distance: Cancer vs Normal')
+        axes[1].legend()
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'embedding_distance_distribution.png'), dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Saved: {output_dir}/embedding_distance_distribution.png")
+
+    # -------------------------------------------------------------------------
+    # Plot 5: Alignment visualization (connecting matched pairs)
+    # -------------------------------------------------------------------------
+    fig, ax = plt.subplots(figsize=(12, 10))
+
+    # Plot points
+    ax.scatter(exp_coords[:, 0], exp_coords[:, 1], c='blue', alpha=0.3, s=15, label='Expression')
+    ax.scatter(cnv_coords[:, 0], cnv_coords[:, 1], c='red', alpha=0.3, s=15, label='CNV')
+
+    # Draw lines connecting matched pairs (subsample for clarity)
+    n_lines = min(200, n_viz)
+    line_idx = np.random.choice(n_viz, n_lines, replace=False)
+
+    for i in line_idx:
+        # Color line by distance (green=close, red=far)
+        dist = distances[i]
+        color = plt.cm.RdYlGn_r(dist / distances.max())
+        ax.plot([exp_coords[i, 0], cnv_coords[i, 0]],
+                [exp_coords[i, 1], cnv_coords[i, 1]],
+                c=color, alpha=0.3, linewidth=0.5)
+
+    ax.set_xlabel(f'{method.upper()}1')
+    ax.set_ylabel(f'{method.upper()}2')
+    ax.set_title('Embedding Alignment\n(Lines connect expression-CNV pairs for same cell)')
+    ax.legend(markerscale=3)
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'embedding_alignment.png'), dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Saved: {output_dir}/embedding_alignment.png")
+
+    # -------------------------------------------------------------------------
+    # Plot 6: Combined view with distance coloring
+    # -------------------------------------------------------------------------
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+
+    # Expression embeddings colored by distance
+    sc1 = axes[0].scatter(exp_coords[:, 0], exp_coords[:, 1],
+                          c=distances, cmap='RdYlGn_r', alpha=0.6, s=15)
+    axes[0].set_xlabel(f'{method.upper()}1')
+    axes[0].set_ylabel(f'{method.upper()}2')
+    axes[0].set_title('Expression Embeddings\n(Color = distance to matched CNV)')
+    plt.colorbar(sc1, ax=axes[0], label='Embedding Distance')
+
+    # CNV embeddings colored by distance
+    sc2 = axes[1].scatter(cnv_coords[:, 0], cnv_coords[:, 1],
+                          c=distances, cmap='RdYlGn_r', alpha=0.6, s=15)
+    axes[1].set_xlabel(f'{method.upper()}1')
+    axes[1].set_ylabel(f'{method.upper()}2')
+    axes[1].set_title('CNV Embeddings\n(Color = distance to matched expression)')
+    plt.colorbar(sc2, ax=axes[1], label='Embedding Distance')
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'embedding_by_distance.png'), dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Saved: {output_dir}/embedding_by_distance.png")
+
+    # -------------------------------------------------------------------------
+    # Summary statistics
+    # -------------------------------------------------------------------------
+    print("\n" + "=" * 50)
+    print("Embedding Space Summary")
+    print("=" * 50)
+    print(f"Total cells visualized: {n_viz:,}")
+    print(f"Embedding dimension: {exp_embeds.shape[1]}")
+    print(f"\nEmbedding distances:")
+    print(f"  Mean: {distances.mean():.4f}")
+    print(f"  Median: {np.median(distances):.4f}")
+    print(f"  Std: {distances.std():.4f}")
+    print(f"  Min: {distances.min():.4f}")
+    print(f"  Max: {distances.max():.4f}")
+
+    if 'cancer_vs_normal' in metadata.columns:
+        cancer_mask = metadata['cancer_vs_normal'].values == 'Cancer'
+        print(f"\nBy cancer status:")
+        print(f"  Normal mean distance: {distances[~cancer_mask].mean():.4f}")
+        print(f"  Cancer mean distance: {distances[cancer_mask].mean():.4f}")
+
+    # Save embedding data for further analysis
+    embed_df = pd.DataFrame({
+        'cell_id': dataset.cell_ids[:n_viz] if sample_size else dataset.cell_ids,
+        'exp_umap1': exp_coords[:, 0],
+        'exp_umap2': exp_coords[:, 1],
+        'cnv_umap1': cnv_coords[:, 0],
+        'cnv_umap2': cnv_coords[:, 1],
+        'embedding_distance': distances
+    })
+
+    # Add metadata columns
+    for col in ['cancer_vs_normal', 'cnv_leiden', 'cnv_score']:
+        if col in metadata.columns:
+            embed_df[col] = metadata[col].values
+
+    embed_df.to_csv(os.path.join(output_dir, 'embedding_coordinates.csv'), index=False)
+    print(f"\nSaved: {output_dir}/embedding_coordinates.csv")
+
+
 def evaluate_retrieval(
     model: ContrastiveModel,
     dataset: ExpressionCNVDataset,
@@ -727,6 +1011,24 @@ def main():
         default=1e-3,
         help='Learning rate'
     )
+    parser.add_argument(
+        '--visualize',
+        action='store_true',
+        help='Visualize the embedding space after training'
+    )
+    parser.add_argument(
+        '--viz-method',
+        type=str,
+        default='umap',
+        choices=['umap', 'pca'],
+        help='Dimensionality reduction method for visualization'
+    )
+    parser.add_argument(
+        '--viz-sample',
+        type=int,
+        default=None,
+        help='Number of cells to sample for visualization (default: all)'
+    )
 
     args = parser.parse_args()
 
@@ -782,6 +1084,55 @@ def main():
             print(f"  {metric}: {value:.4f}")
 
         print(f"\nModel saved to: {args.output_dir}")
+
+        # Visualize if requested
+        if args.visualize:
+            print("\n" + "=" * 60)
+            print("Visualizing Embedding Space")
+            print("=" * 60)
+            visualize_embedding_space(
+                model, datasets['test'], device,
+                output_dir=args.output_dir,
+                method=args.viz_method,
+                sample_size=args.viz_sample
+            )
+
+    elif args.visualize:
+        # Just visualize existing model
+        model_path = os.path.join(args.output_dir, 'best_model.pt')
+        if not os.path.exists(model_path):
+            print(f"No trained model found at {model_path}")
+            print("Run with --train first")
+            return
+
+        print(f"\nLoading model from {model_path}")
+        checkpoint = torch.load(model_path, weights_only=False)
+
+        if torch.cuda.is_available():
+            device = torch.device('cuda')
+        elif torch.backends.mps.is_available():
+            device = torch.device('mps')
+        else:
+            device = torch.device('cpu')
+
+        model = ContrastiveModel(
+            expression_dim=checkpoint['expression_dim'],
+            cnv_dim=checkpoint['cnv_dim'],
+            latent_dim=checkpoint['latent_dim']
+        ).to(device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+
+        datasets = prepare_data(patient_ids)
+
+        print("\n" + "=" * 60)
+        print("Visualizing Embedding Space")
+        print("=" * 60)
+        visualize_embedding_space(
+            model, datasets['test'], device,
+            output_dir=args.output_dir,
+            method=args.viz_method,
+            sample_size=args.viz_sample
+        )
 
     elif args.evaluate:
         # Load model and evaluate
