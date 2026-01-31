@@ -91,53 +91,100 @@ class HardNegativeDataset(Dataset):
         expression: np.ndarray,
         cnv: np.ndarray,
         cnv_sim_thresh: float,
-        expr_dissim_thresh: float
+        expr_dissim_thresh: float,
+        max_candidates: int = 5000
     ) -> Dict[int, np.ndarray]:
         """
-        Find hard negatives for each cell.
+        Find hard negatives for each cell using memory-efficient sampling.
 
         Hard negative = cell with similar CNV but different expression
+
+        For large datasets (>5000 cells), we sample a random subset of candidates
+        to compare against rather than doing full pairwise comparisons.
+        This reduces memory from O(n^2) to O(n * max_candidates).
         """
         n_cells = len(expression)
         hard_negatives = {}
 
-        # Pre-normalize all data once (saves computation)
+        # Pre-normalize all data once
         print(f"    Normalizing {n_cells:,} cells...")
         all_cnv_norm = cnv / (np.linalg.norm(cnv, axis=1, keepdims=True) + 1e-8)
         all_expr_norm = expression / (np.linalg.norm(expression, axis=1, keepdims=True) + 1e-8)
 
-        # Process in batches
-        batch_size = 2000  # Larger batches are faster
+        # Use sampling for large datasets to avoid OOM
+        use_sampling = n_cells > max_candidates
+        if use_sampling:
+            print(f"    Using memory-efficient sampling mode ({max_candidates:,} candidates per batch)")
+            print(f"    This is slower but won't run out of memory")
+
+        # Smaller batches for memory efficiency
+        batch_size = 200 if use_sampling else 1000
         n_batches = (n_cells + batch_size - 1) // batch_size
+
+        cells_with_negatives = 0
+        import time
+        start_time = time.time()
 
         for batch_idx, i in enumerate(range(0, n_cells, batch_size)):
             batch_end = min(i + batch_size, n_cells)
+            batch_indices = np.arange(i, batch_end)
 
-            # Progress indicator
-            print(f"    Processing batch {batch_idx + 1}/{n_batches} (cells {i:,}-{batch_end:,})...", end='\r')
+            # Progress with ETA
+            elapsed = time.time() - start_time
+            if batch_idx > 0:
+                eta = elapsed / batch_idx * (n_batches - batch_idx)
+                eta_str = f"ETA: {eta/60:.1f}min"
+            else:
+                eta_str = "ETA: calculating..."
 
-            # CNV similarity for this batch
-            cnv_sim = np.dot(all_cnv_norm[i:batch_end], all_cnv_norm.T)
+            print(f"    Batch {batch_idx + 1}/{n_batches} | "
+                  f"Cells with negatives: {cells_with_negatives:,} | {eta_str}     ", end='\r')
 
-            # Expression dissimilarity for this batch
-            expr_sim = np.dot(all_expr_norm[i:batch_end], all_expr_norm.T)
-            expr_dissim = 1 - expr_sim
+            if use_sampling:
+                # Sample random candidates (excluding current batch)
+                all_indices = np.arange(n_cells)
+                mask = ~np.isin(all_indices, batch_indices)
+                available = all_indices[mask]
 
-            # Find hard negatives for each cell in batch
-            for j, idx in enumerate(range(i, batch_end)):
-                # Candidates: high CNV similarity, high expression dissimilarity
-                candidates = np.where(
-                    (cnv_sim[j] > cnv_sim_thresh) &
-                    (expr_dissim[j] > expr_dissim_thresh) &
-                    (np.arange(n_cells) != idx)  # Exclude self
-                )[0]
+                if len(available) > max_candidates:
+                    sample_idx = np.random.choice(available, max_candidates, replace=False)
+                else:
+                    sample_idx = available
 
-                if len(candidates) > 0:
-                    # Rank by expression dissimilarity (most different first)
-                    ranked = candidates[np.argsort(-expr_dissim[j, candidates])]
-                    hard_negatives[idx] = ranked[:self.n_hard_negatives * 2]  # Keep extra for sampling
+                # Compute similarities only against sampled candidates
+                cnv_sim = np.dot(all_cnv_norm[batch_indices], all_cnv_norm[sample_idx].T)
+                expr_sim = np.dot(all_expr_norm[batch_indices], all_expr_norm[sample_idx].T)
+                expr_dissim = 1 - expr_sim
 
-        print()  # New line after progress
+                for j, idx in enumerate(batch_indices):
+                    candidates_mask = (cnv_sim[j] > cnv_sim_thresh) & (expr_dissim[j] > expr_dissim_thresh)
+                    candidates_local = np.where(candidates_mask)[0]
+
+                    if len(candidates_local) > 0:
+                        candidates_global = sample_idx[candidates_local]
+                        ranked = candidates_global[np.argsort(-expr_dissim[j, candidates_local])]
+                        hard_negatives[idx] = ranked[:self.n_hard_negatives * 2]
+                        cells_with_negatives += 1
+            else:
+                # Full pairwise for smaller datasets
+                cnv_sim = np.dot(all_cnv_norm[batch_indices], all_cnv_norm.T)
+                expr_sim = np.dot(all_expr_norm[batch_indices], all_expr_norm.T)
+                expr_dissim = 1 - expr_sim
+
+                for j, idx in enumerate(batch_indices):
+                    candidates = np.where(
+                        (cnv_sim[j] > cnv_sim_thresh) &
+                        (expr_dissim[j] > expr_dissim_thresh) &
+                        (np.arange(n_cells) != idx)
+                    )[0]
+
+                    if len(candidates) > 0:
+                        ranked = candidates[np.argsort(-expr_dissim[j, candidates])]
+                        hard_negatives[idx] = ranked[:self.n_hard_negatives * 2]
+                        cells_with_negatives += 1
+
+        elapsed = time.time() - start_time
+        print(f"\n    Done in {elapsed/60:.1f} minutes. Found hard negatives for {cells_with_negatives:,}/{n_cells:,} cells")
         return hard_negatives
 
     def __len__(self):
@@ -448,9 +495,15 @@ def load_patient_data(
 
 def load_all_patients(
     patient_ids: List[str],
-    cnv_dir: str = 'data/cnv_output'
+    cnv_dir: str = 'data/cnv_output',
+    max_cells_per_patient: Optional[int] = None
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, pd.DataFrame]:
-    """Load and concatenate data from multiple patients."""
+    """Load and concatenate data from multiple patients.
+
+    Args:
+        max_cells_per_patient: If set, randomly subsample to this many cells
+                               per patient to reduce memory usage.
+    """
     all_expression = []
     all_cnv = []
     all_cell_ids = []
@@ -459,6 +512,16 @@ def load_all_patients(
     for patient_id in patient_ids:
         try:
             expr, cnv, cells, meta = load_patient_data(patient_id, cnv_dir)
+
+            # Subsample if requested
+            if max_cells_per_patient is not None and len(cells) > max_cells_per_patient:
+                idx = np.random.choice(len(cells), max_cells_per_patient, replace=False)
+                expr = expr[idx]
+                cnv = cnv[idx]
+                cells = cells[idx]
+                meta = meta.iloc[idx]
+                print(f"    Subsampled to {max_cells_per_patient:,} cells")
+
             cells = np.array([f"{patient_id}_{c}" for c in cells])
             meta['patient_id'] = patient_id
 
@@ -491,12 +554,20 @@ def prepare_data(
     random_seed: int = 42,
     n_hard_negatives: int = 5,
     cnv_similarity_threshold: float = 0.9,
-    expression_dissimilarity_threshold: float = 0.5
+    expression_dissimilarity_threshold: float = 0.5,
+    max_cells_per_patient: Optional[int] = None
 ) -> Dict:
-    """Prepare train/val/test datasets with hard negative mining."""
+    """Prepare train/val/test datasets with hard negative mining.
+
+    Args:
+        max_cells_per_patient: If set, subsample to this many cells per patient
+                               to reduce memory usage. None = use all cells.
+    """
     np.random.seed(random_seed)
 
-    expression, cnv, cell_ids, metadata = load_all_patients(patient_ids)
+    expression, cnv, cell_ids, metadata = load_all_patients(
+        patient_ids, max_cells_per_patient=max_cells_per_patient
+    )
 
     # Normalize
     expression_mean = expression.mean(axis=0)
@@ -843,6 +914,8 @@ def main():
                         help='Minimum CNV similarity for hard negative candidates')
     parser.add_argument('--expr-dissim-threshold', type=float, default=0.3,
                         help='Minimum expression dissimilarity for hard negatives')
+    parser.add_argument('--max-cells-per-patient', type=int, default=None,
+                        help='Subsample to N cells per patient to reduce memory (default: use all)')
 
     args = parser.parse_args()
 
@@ -862,11 +935,15 @@ def main():
 
     if args.train:
         print("\nPreparing data with hard negative mining...")
+        if args.max_cells_per_patient:
+            print(f"Subsampling to {args.max_cells_per_patient:,} cells per patient for memory efficiency")
+
         datasets = prepare_data(
             patient_ids,
             n_hard_negatives=args.n_hard_negatives,
             cnv_similarity_threshold=args.cnv_sim_threshold,
-            expression_dissimilarity_threshold=args.expr_dissim_threshold
+            expression_dissimilarity_threshold=args.expr_dissim_threshold,
+            max_cells_per_patient=args.max_cells_per_patient
         )
 
         model = train_model(

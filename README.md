@@ -1,21 +1,63 @@
-# Weakly Supervised Contrastive Alignment of scRNA-seq to CNV Anchors
+# Contrastive Learning for CNV-Expression Concordance (CLCC)
 
-This repository contains code to recreate the paper "Weakly Supervised Contrastive Alignment of scRNA-seq to CNV Anchors" from scratch.
+A contrastive learning framework to identify genes that escape copy number variation (CNV) dosage effects in cancer. The model learns to align single-cell gene expression with CNV profiles, then identifies cells where expression diverges from expected CNV patterns - revealing potential escape mechanisms.
 
 ## Overview
 
-This project implements a contrastive learning framework that aligns single-cell RNA-seq expression profiles with inferred copy number variation (CNV) information. The key idea is to train a gene expression encoder to align with fixed CNV anchors in a shared latent space.
+**Key Idea**: In cancer, gene expression typically follows CNV dosage (amplified regions → higher expression). However, some genes "escape" this relationship through regulatory mechanisms. This project:
 
-## Quick Setup
+1. Trains a contrastive model to align expression with CNV in a shared latent space
+2. Uses hard negative mining to improve discrimination
+3. Classifies cells as "concordant" (expression follows CNV) or "discordant" (expression escapes CNV)
+4. Performs differential expression to identify escape and compensation genes
 
-### 1. Clone the repository
+## Pipeline
 
-```bash
-git clone https://github.com/YOUR_USERNAME/CLCC.git
-cd CLCC
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  1. Data Preparation                                                         │
+│     00_download_data.py → 02_preprocess_raw_data.py                         │
+│     Download GSE131907 lung adenocarcinoma data, preprocess per patient     │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    ↓
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  2. CNV Inference                                                            │
+│     04_prepare_infercnv.py → 05_run_infercnv.py                             │
+│     Infer CNV profiles using normal cells as reference (inferCNV/R)         │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    ↓
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  3. Contrastive Pre-training                                                 │
+│     07_contrastive_model.py                                                  │
+│     Train expression encoder to align with frozen CNV encoder               │
+│     Loss: InfoNCE contrastive loss                                          │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    ↓
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  4. Hard Negative Mining                                                     │
+│     07b_contrastive_hard_negatives.py                                       │
+│     Fine-tune with triplet loss on hard negatives                           │
+│     (cells with similar CNV but different expression)                       │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    ↓
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  5. Concordance Classification                                               │
+│     08_differential_expression.py                                            │
+│     Compute expression-CNV embedding distance per cell                      │
+│     Classify: Concordant (low distance) vs Discordant (high distance)       │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    ↓
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  6. Differential Expression Analysis                                         │
+│     08_differential_expression.py (per-patient)                              │
+│     08c_pooled_de_analysis.py (pooled cross-patient)                        │
+│     Identify escape genes (↑ in discordant) and compensation genes (↓)      │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 2. Create environment and install dependencies
+## Quick Start
+
+### 1. Setup Environment
 
 ```bash
 conda create -n clcc python=3.10
@@ -23,126 +65,134 @@ conda activate clcc
 pip install -r requirements.txt
 ```
 
-### 3. Download the data
-
-The raw data (~12GB) is hosted on NCBI GEO. Run the download script:
+### 2. Download Data
 
 ```bash
-python download_data.py
+python 00_download_data.py
 ```
 
-This downloads from GSE131907 (Kim et al. 2020 lung adenocarcinoma atlas):
-- `GSE131907_Lung_Cancer_raw_UMI_matrix.txt` (~12GB uncompressed)
-- `GSE131907_Lung_Cancer_cell_annotation.txt` (~19MB)
-- `GSE131907_Lung_Cancer_Feature_Summary.xlsx` (~20KB)
+Downloads GSE131907 lung adenocarcinoma atlas (~12GB).
 
-### 4. Preprocess the data
-
-Process a single patient (P0006 as proof of concept):
+### 3. Preprocess Data
 
 ```bash
-python 01_preprocess_raw_data.py --patient P0006
+# Single patient
+python 02_preprocess_raw_data.py --patient P0006
+
+# All patients
+python 02_preprocess_raw_data.py --all-patients
 ```
 
-Or process all 10 matched tumor/normal patients:
+### 4. Run CNV Inference
 
 ```bash
-python 01_preprocess_raw_data.py --all-patients
+python 04_prepare_infercnv.py --patient P0006
+python 05_run_infercnv.py --patient P0006
 ```
 
-This creates preprocessed `.h5ad` files in `data/processed/`.
-
-### 5. Install inferCNV (R package)
-
+Requires R with inferCNV installed:
 ```R
-install.packages("BiocManager")
 BiocManager::install("infercnv")
+```
+
+### 5. Train Contrastive Model
+
+```bash
+# Base contrastive training
+python 07_contrastive_model.py
+
+# Hard negative fine-tuning (memory-efficient for local machines)
+python 07b_contrastive_hard_negatives.py --max-cells-per-patient 5000
+```
+
+### 6. Run Differential Expression
+
+```bash
+# Per-patient DE with summary compilation
+python 08_differential_expression.py --model-dir models/contrastive_hn --compile-summary
+
+# Pooled cross-patient DE (more statistical power)
+python 08c_pooled_de_analysis.py --model-dir models/contrastive_hn
 ```
 
 ## Project Structure
 
 ```
 CLCC/
-├── data/
-│   ├── raw/                    # Raw data (downloaded from GEO)
-│   └── processed/              # Preprocessed .h5ad files
-├── notebooks/
-│   ├── 00_explore_raw_data.ipynb
-│   └── 01_explore_processed_data.ipynb
-├── 01_preprocess_raw_data.py   # Preprocessing pipeline
-├── 01_data_processing.py       # Dataset classes and utilities
-├── model.py                    # Encoder architectures
-├── losses.py                   # Loss functions
-├── train.py                    # Training loop
-├── evaluation.py               # Evaluation metrics
-├── download_data.py            # Data download script
+├── 00_download_data.py           # Download raw data from GEO
+├── 02_preprocess_raw_data.py     # Preprocess scRNA-seq data
+├── 04_prepare_infercnv.py        # Prepare inputs for inferCNV
+├── 05_run_infercnv.py            # Run CNV inference
+├── 07_contrastive_model.py       # Base contrastive training
+├── 07b_contrastive_hard_negatives.py  # Hard negative mining
+├── 08_differential_expression.py      # Per-patient DE analysis
+├── 08b_standard_de.py            # Standard DE (cancer vs normal)
+├── 08c_pooled_de_analysis.py     # Pooled cross-patient DE
+├── notebooks/                    # Exploration notebooks
+│   ├── 01_explore_raw_data.ipynb
+│   ├── 03_explore_processed_data.ipynb
+│   ├── 06_explore_example_cnv_results.ipynb
+│   └── 09_explore_concordance_results.ipynb
+├── data/                         # Data directory (gitignored)
+│   ├── raw/                      # Raw GEO downloads
+│   ├── processed/                # Preprocessed .h5ad files
+│   ├── cnv_output/               # inferCNV results
+│   └── de_results/               # DE analysis outputs
+├── models/                       # Trained models (gitignored)
 ├── requirements.txt
 └── README.md
 ```
 
-## Data
+## Key Outputs
 
-This project uses the GSE131907 dataset containing scRNA-seq from lung adenocarcinoma patients.
+After running the full pipeline, `data/de_results/` contains:
 
-**Matched tumor/normal patients available:**
-| Patient | Tumor Sample | Normal Sample |
-|---------|--------------|---------------|
-| P0006   | LUNG_T06     | LUNG_N06      |
-| P0008   | LUNG_T08     | LUNG_N08      |
-| P0009   | LUNG_T09     | LUNG_N09      |
-| P0018   | LUNG_T18     | LUNG_N18      |
-| P0019   | LUNG_T19     | LUNG_N19      |
-| P0020   | LUNG_T20     | LUNG_N20      |
-| P0028   | LUNG_T28     | LUNG_N28      |
-| P0030   | LUNG_T30     | LUNG_N30      |
-| P0031   | LUNG_T31     | LUNG_N31      |
-| P0034   | LUNG_T34     | LUNG_N34      |
-
-## Pipeline Overview
-
-1. **Preprocessing** (`01_preprocess_raw_data.py`)
-   - Load raw UMI counts for specific patient
-   - Run data integrity checks
-   - Merge cell annotations
-   - Calculate QC metrics (UMIs, genes, MT%)
-   - Create `cancer_vs_normal` labels
-   - Save as `.h5ad` for downstream analysis
-
-2. **CNV Inference** (inferCNV in R)
-   - Use normal cells as reference
-   - Generate CNV profiles per subcluster
-   - Output: CNV matrix for contrastive learning
-
-3. **Model Training** (`train.py`)
-   - Expression encoder learns to align with CNV anchors
-   - InfoNCE contrastive loss + centroid regularization
-   - CNV encoder is frozen
-
-4. **Evaluation** (`evaluation.py`)
-   - Top-k retrieval accuracy in z-space
-   - Expected: ~97% accuracy
+| File | Description |
+|------|-------------|
+| `pooled_de_results.csv` | Full DE results across all cells |
+| `pooled_escape_genes.csv` | Genes higher in discordant cells (escape CNV) |
+| `pooled_compensation_genes.csv` | Genes lower in discordant cells |
+| `summary_all_patients.csv` | Per-patient summary statistics |
+| `recurrent_genes.csv` | Genes significant in multiple patients |
 
 ## Model Architecture
 
-- **Expression Encoder**: 3-layer MLP (n_genes → 256 → 256 → 256)
-- **CNV Encoder**: 3-layer MLP (n_genes → 256 → 256 → 256) - **FROZEN**
-- **Projection Heads**: 256 → 128 → 64 with L2 normalization
+- **Expression Encoder**: MLP (n_genes → 512 → 256 → 128)
+- **CNV Encoder**: MLP (n_genes → 512 → 256 → 128) - **FROZEN**
+- **Contrastive Loss**: InfoNCE + Triplet loss on hard negatives
+- **Hard Negatives**: Cells with similar CNV but divergent expression
+
+## Data
+
+Uses GSE131907 (Kim et al. 2020) lung adenocarcinoma atlas with 10 matched tumor/normal patients:
+
+| Patient | Tumor | Normal |
+|---------|-------|--------|
+| P0006 | LUNG_T06 | LUNG_N06 |
+| P0008 | LUNG_T08 | LUNG_N08 |
+| P0009 | LUNG_T09 | LUNG_N09 |
+| P0018 | LUNG_T18 | LUNG_N18 |
+| P0019 | LUNG_T19 | LUNG_N19 |
+| P0020 | LUNG_T20 | LUNG_N20 |
+| P0028 | LUNG_T28 | LUNG_N28 |
+| P0030 | LUNG_T30 | LUNG_N30 |
+| P0031 | LUNG_T31 | LUNG_N31 |
+| P0034 | LUNG_T34 | LUNG_N34 |
 
 ## Requirements
 
-See `requirements.txt`. Key dependencies:
-- scanpy
+Key dependencies (see `requirements.txt`):
 - torch
-- pandas
-- numpy
-- matplotlib
-- seaborn
+- scanpy
+- pandas, numpy
+- scipy (for statistical tests)
+- matplotlib, seaborn
 
 ## Citation
 
 ```
 Goswami, G., Xu, D., & Park, H. J. (2025).
-Weakly Supervised Contrastive Alignment of scRNA-seq to CNV Anchors.
+Contrastive Learning for CNV-Expression Concordance Analysis.
 ```
 
 ## License

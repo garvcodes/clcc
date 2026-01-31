@@ -1007,6 +1007,188 @@ def run_concordance_pipeline(
     return results
 
 
+def compile_cross_patient_summary(output_dir: str, patient_ids: List[str]):
+    """
+    Compile a summary of DE results across all patients.
+
+    Creates:
+    - summary_all_patients.csv: Overview statistics per patient
+    - escape_genes_all_patients.csv: All escape genes with patient counts
+    - compensation_genes_all_patients.csv: All compensation genes with patient counts
+    - recurrent_genes.csv: Genes appearing in multiple patients
+    """
+    print("\n" + "=" * 70)
+    print("COMPILING CROSS-PATIENT SUMMARY")
+    print("=" * 70)
+
+    summary_rows = []
+    all_escape = []
+    all_compensation = []
+    all_de = []
+
+    for patient_id in patient_ids:
+        patient_dir = os.path.join(output_dir, patient_id)
+
+        # Check if results exist
+        escape_file = os.path.join(patient_dir, 'escape_genes.csv')
+        comp_file = os.path.join(patient_dir, 'compensation_genes.csv')
+        de_file = os.path.join(patient_dir, 'de_concordant_vs_discordant.csv')
+        concordance_file = os.path.join(patient_dir, 'cell_concordance.csv')
+
+        if not os.path.exists(escape_file):
+            print(f"  Skipping {patient_id} - no results found")
+            continue
+
+        # Load results
+        escape_df = pd.read_csv(escape_file)
+        comp_df = pd.read_csv(comp_file)
+        de_df = pd.read_csv(de_file)
+
+        # Add patient ID
+        escape_df['patient_id'] = patient_id
+        comp_df['patient_id'] = patient_id
+        de_df['patient_id'] = patient_id
+
+        all_escape.append(escape_df)
+        all_compensation.append(comp_df)
+        all_de.append(de_df)
+
+        # Cell counts
+        n_concordant = n_discordant = n_cancer = 0
+        if os.path.exists(concordance_file):
+            conc_df = pd.read_csv(concordance_file)
+            n_concordant = (conc_df['cnv_concordance'] == 'Concordant').sum()
+            n_discordant = (conc_df['cnv_concordance'] == 'Discordant').sum()
+            if 'cancer_vs_normal' in conc_df.columns:
+                n_cancer = (conc_df['cancer_vs_normal'] == 'Cancer').sum()
+
+        # Statistics
+        n_sig = de_df['significant'].sum() if 'significant' in de_df.columns else 0
+        n_escape = len(escape_df)
+        n_comp = len(comp_df)
+
+        # Best p-values
+        min_pval = de_df['pvals_adj'].min() if 'pvals_adj' in de_df.columns else 1.0
+
+        summary_rows.append({
+            'patient_id': patient_id,
+            'n_cancer_cells': n_cancer,
+            'n_concordant': n_concordant,
+            'n_discordant': n_discordant,
+            'n_significant_genes': n_sig,
+            'n_escape_genes': n_escape,
+            'n_compensation_genes': n_comp,
+            'min_adj_pval': min_pval,
+            'has_fdr_significant': min_pval < 0.05
+        })
+
+        print(f"  {patient_id}: {n_escape} escape, {n_comp} compensation genes")
+
+    if not summary_rows:
+        print("No patient results found!")
+        return
+
+    # Create summary DataFrame
+    summary_df = pd.DataFrame(summary_rows)
+    summary_path = os.path.join(output_dir, 'summary_all_patients.csv')
+    summary_df.to_csv(summary_path, index=False)
+    print(f"\nSaved: {summary_path}")
+
+    # Combine all escape genes
+    if all_escape:
+        escape_combined = pd.concat(all_escape, ignore_index=True)
+        escape_path = os.path.join(output_dir, 'escape_genes_all_patients.csv')
+        escape_combined.to_csv(escape_path, index=False)
+        print(f"Saved: {escape_path}")
+
+        # Count gene occurrences
+        escape_counts = escape_combined.groupby('gene').agg({
+            'patient_id': ['count', lambda x: ','.join(sorted(x))],
+            'logFC': 'mean',
+            'pval_adj': 'min'
+        }).reset_index()
+        escape_counts.columns = ['gene', 'n_patients', 'patients', 'mean_logFC', 'min_pval_adj']
+        escape_counts = escape_counts.sort_values('n_patients', ascending=False)
+
+    # Combine all compensation genes
+    if all_compensation:
+        comp_combined = pd.concat(all_compensation, ignore_index=True)
+        comp_path = os.path.join(output_dir, 'compensation_genes_all_patients.csv')
+        comp_combined.to_csv(comp_path, index=False)
+        print(f"Saved: {comp_path}")
+
+        # Count gene occurrences
+        comp_counts = comp_combined.groupby('gene').agg({
+            'patient_id': ['count', lambda x: ','.join(sorted(x))],
+            'logFC': 'mean',
+            'pval_adj': 'min'
+        }).reset_index()
+        comp_counts.columns = ['gene', 'n_patients', 'patients', 'mean_logFC', 'min_pval_adj']
+        comp_counts = comp_counts.sort_values('n_patients', ascending=False)
+
+    # Create recurrent genes summary (genes in 2+ patients)
+    recurrent_rows = []
+
+    if all_escape:
+        recurrent_escape = escape_counts[escape_counts['n_patients'] >= 2].copy()
+        recurrent_escape['gene_type'] = 'escape'
+        for _, row in recurrent_escape.iterrows():
+            recurrent_rows.append({
+                'gene': row['gene'],
+                'gene_type': 'escape',
+                'n_patients': row['n_patients'],
+                'patients': row['patients'],
+                'mean_logFC': row['mean_logFC'],
+                'min_pval_adj': row['min_pval_adj']
+            })
+
+    if all_compensation:
+        recurrent_comp = comp_counts[comp_counts['n_patients'] >= 2].copy()
+        for _, row in recurrent_comp.iterrows():
+            recurrent_rows.append({
+                'gene': row['gene'],
+                'gene_type': 'compensation',
+                'n_patients': row['n_patients'],
+                'patients': row['patients'],
+                'mean_logFC': row['mean_logFC'],
+                'min_pval_adj': row['min_pval_adj']
+            })
+
+    if recurrent_rows:
+        recurrent_df = pd.DataFrame(recurrent_rows)
+        recurrent_df = recurrent_df.sort_values(['n_patients', 'gene_type'], ascending=[False, True])
+        recurrent_path = os.path.join(output_dir, 'recurrent_genes.csv')
+        recurrent_df.to_csv(recurrent_path, index=False)
+        print(f"Saved: {recurrent_path}")
+
+        n_recurrent_escape = len(recurrent_df[recurrent_df['gene_type'] == 'escape'])
+        n_recurrent_comp = len(recurrent_df[recurrent_df['gene_type'] == 'compensation'])
+        print(f"\nRecurrent genes (in 2+ patients):")
+        print(f"  Escape: {n_recurrent_escape} genes")
+        print(f"  Compensation: {n_recurrent_comp} genes")
+
+    # Print summary statistics
+    print("\n" + "-" * 50)
+    print("SUMMARY STATISTICS")
+    print("-" * 50)
+    print(f"Total patients analyzed: {len(summary_df)}")
+    print(f"Total escape genes found: {summary_df['n_escape_genes'].sum()}")
+    print(f"Total compensation genes found: {summary_df['n_compensation_genes'].sum()}")
+    print(f"Patients with FDR-significant genes: {summary_df['has_fdr_significant'].sum()}")
+
+    if all_escape:
+        top_escape = escape_counts.head(10)
+        print(f"\nTop escape genes (by # patients):")
+        for _, row in top_escape.iterrows():
+            print(f"  {row['gene']}: {row['n_patients']} patients ({row['patients']})")
+
+    if all_compensation:
+        top_comp = comp_counts.head(10)
+        print(f"\nTop compensation genes (by # patients):")
+        for _, row in top_comp.iterrows():
+            print(f"  {row['gene']}: {row['n_patients']} patients ({row['patients']})")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Run concordance-based DE analysis for cancer cells (compensation mechanisms)'
@@ -1085,18 +1267,9 @@ def main():
             traceback.print_exc()
             continue
 
-    # Summary across patients
-    if len(all_results) > 1:
-        print("\n" + "=" * 70)
-        print("CROSS-PATIENT SUMMARY")
-        print("=" * 70)
-
-        for patient_id, results in all_results.items():
-            print(f"\n{patient_id}:")
-            for name, df in results.items():
-                if 'significant' in df.columns:
-                    n_sig = df['significant'].sum()
-                    print(f"  {name}: {n_sig:,} significant genes")
+    # Compile cross-patient summary
+    if len(all_results) >= 1:
+        compile_cross_patient_summary(args.output_dir, patient_ids)
 
     # Print interpretation guide
     print("\n" + "=" * 70)
